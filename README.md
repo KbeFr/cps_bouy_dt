@@ -2,7 +2,7 @@
 
 ## Thought behind Digital Twin
  
-For a Digital Twin, real time data processing and the possibility for simulation is impoertant.
+For a Digital Twin, real time data processing and the possibility for simulation is important.
 
 For the simulation we wanted to make this as realasitic as we could, so we set out to create a river model 
 that was to scale with a real world river segment of the Meuse. 
@@ -37,7 +37,7 @@ There is the possibility to RPC to the bouy via thingsboard (see `BouyComm.send_
 
 ![plot](assets/image.png)
 
-*Note that the backtracking is broken
+*Note that the backtracking is broken 
 
 ## Project Structure
 
