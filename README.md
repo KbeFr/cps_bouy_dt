@@ -115,8 +115,9 @@ These steps are also annotated on the map.
 
 ## Left to do 
 - `_check_contamination()` in `simulation.py` still needs a proper contamination trigger
-- The backtracking needs to be fixed
-- the coordinate transformation from local to gps for poition in the river simulation can be greatly optimized still. (preprocess)
+- The backtracking `AdjointDVsolver` needs to be fixed, location is not respected and parameter are not optimized.
+- The coordinate transformation from local to gps for poition in the river simulation can be optimized still. (preprocess)
+- Config the river model better or make it more easy configurable in config.py or something. (secondary velocity, ...)
 
 
 
