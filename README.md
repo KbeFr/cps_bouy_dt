@@ -116,7 +116,7 @@ These steps are also annotated on the map.
 ## Left to do 
 - `_check_contamination()` in `simulation.py` still needs a proper contamination trigger
 - The backtracking needs to be fixed
-- The bouy tracking on the gps coordinated flips on on corners 
+- the coordinate transformation from local to gps for poition in the river simulation can be greatly optimized still. (preprocess)
 
 
 
