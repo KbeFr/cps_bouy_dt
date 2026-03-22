@@ -25,8 +25,8 @@ DEFAULT_TOPOLOGY = [
     (0,  200),
 ]
 
-DEFAULT_MERGE_WINDOW_M = 600.0  # metres — consecutive bends within this distance are merged
-DEFAULT_MIN_ANGLE = 3 #at what angle is the drawn line intersection considered a bend
+DEFAULT_MERGE_WINDOW_M = 500.0  # metres — consecutive bends within this distance are merged
+DEFAULT_MIN_ANGLE = 0 #at what angle is the drawn line intersection considered a bend
 
 DEFAULT_WIDTH          = 80      # metres
 DEFAULT_DS_L           = 5     # grid spacing along stream

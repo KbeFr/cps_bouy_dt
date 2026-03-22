@@ -119,8 +119,8 @@ class GeoReference:
         for i in range(1, n - 1):
             delta = headings[i] - headings[i - 1]
             delta = (delta + np.pi) % (2 * np.pi) - np.pi
-            if abs(delta) > np.radians(min_angle_deg):
-                raw_bends.append([cum_s[i], delta])
+            #if abs(delta) > np.radians(min_angle_deg):
+            raw_bends.append([cum_s[i], delta])
 
         if not raw_bends:
             return [(0, float(cum_s[-1]))]

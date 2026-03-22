@@ -33,6 +33,11 @@ Ofcourse having a way to physically steer the board against the current and runn
 
 There is the possibility to RPC to the bouy via thingsboard (see `BouyComm.send_rpc() for draft call), so motor controll from this dashboard could be possible.
 
+## Example UI 
+
+![plot](assets/image.png)
+
+*Note that the backtracking is broken
 
 ## Project Structure
 
