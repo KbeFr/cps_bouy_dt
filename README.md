@@ -111,7 +111,7 @@ Topics that are expected from thingsboard device :
 
 1. **Draw the width of the river (bank to bank)** on the satellite map using the `polyline tool` (toolbar top-right of map)
 2. **Draw the river** on the satellite map using the `polyline tool` (toolbar top-right of map)
-    If you want to draw a bend, i suggest drawing in small steps (500m) each with a angle from each other greather than 3deg. 
+    If you want to draw a bend, i suggest drawing in small steps (500m) each with an angle from each other greather than 3deg. 
     If you do this the line seglents will be merged into one large bend, which will look neater.
 3. **Annotate the bouy start** on the satellite map using the `waypoint tool` (toolbar top-right of map)
 4. Click **▶ START** in the sidebar 
