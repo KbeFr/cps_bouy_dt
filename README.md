@@ -123,7 +123,7 @@ These steps are also annotated on the map.
 - The backtracking `AdjointDVsolver` needs to be fixed, location is not respected and parameter are not optimized.
 - The coordinate transformation from local to gps for poition in the river simulation can be optimized still. (preprocess)
 - Config the river model better or make it more easy configurable in config.py or something. (secondary velocity, ...)
-
+- Grid spacing for the river model is hard coded at the moment, this could be bad if bigger river segments are modeled.
 
 
 
