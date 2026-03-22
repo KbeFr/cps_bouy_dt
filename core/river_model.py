@@ -1,0 +1,633 @@
+# =============================================================================
+# core/river_model.py — River physics model
+# =============================================================================
+#
+# Classes
+#   River               — builds the 2D curvilinear river grid and flow field
+#   LagrangianParticles — stochastic particle-tracking (advection + diffusion)
+#   DVsolver            — implicit advection-diffusion PDE solver (FVM)
+
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter1d
+from discretize import TensorMesh
+from scipy.sparse.linalg import splu
+from discretize.utils import sdiag, mkvc
+
+
+# =============================================================================
+# River
+# =============================================================================
+
+class River:
+    """
+    Builds a 2D curvilinear river grid from a topology description and
+    computes the steady-state flow field at every grid cell.
+
+    Parameters
+    ----------
+    topology : list of (int, info)
+        Sequence of river segments:
+            (0, length)          — straight section, length in metres
+            (1, (radius, angle)) — bend, radius in metres, angle in degrees
+                                   positive angle = left turn, negative = right turn
+    width : float
+        River width in metres.
+    ds_length : float
+        Grid spacing along the stream direction in metres.
+    n_width : int
+        Number of grid points across the river width.
+    u_avg : float
+        Depth-averaged flow speed in straight sections (m/s).
+    alpha_secondary : float
+        Scaling factor for the cross-stream (secondary) flow in bends.
+
+    Attributes (read-only after construction)
+    -----------------------------------------
+    xc, yc : ndarray (N,)
+        Cartesian coordinates of the river centreline.
+    curv : ndarray (N,)
+        Local curvature at each centreline point (1/m).
+    vis_x, vis_y : ndarray (N, n_width)
+        Cartesian coordinates of every grid cell.
+    vis_v : ndarray (N, n_width)
+        Streamwise velocity magnitude at every grid cell (m/s).
+    vis_vn : ndarray (N, n_width)
+        Cross-stream (secondary) velocity magnitude at every grid cell (m/s).
+    grid_data : ndarray (N*n_width, 2)
+        Flat array of [speed, direction_angle] for every grid cell.
+        Used by the KD-tree for fast nearest-cell lookup.
+    physics_tree : cKDTree
+        Spatial index over all grid cell centres.
+    centerline_tree : cKDTree
+        Spatial index over the centreline points (used for boundary enforcement).
+    ds_length : float
+        Grid spacing (stored for use by DVsolver).
+    dn : float
+        Grid spacing across the width (derived from n_width).
+    """
+
+    def __init__(
+        self,
+        topology: list,
+        width: float,
+        ds_length : float,
+        n_width: int,
+        u_avg: float,
+        alpha_secondary: float
+    ):
+        self.width      = width
+        self.half_width = width / 2.0
+        self.ds_length  = ds_length 
+        self.n_width    = n_width
+
+        # ------------------------------------------------------------------
+        # Build centreline
+        # ------------------------------------------------------------------
+        x_cl, y_cl = [0.0], [0.0]
+        theta = 0.0     # current heading angle (radians)
+        curv  = []      # curvature at each step
+
+        
+
+
+        for seg_type, measures in topology:
+
+            if seg_type == 0:
+                # Straight section
+                length = measures
+                n_steps = max(1, int(length / ds_length))
+                for _ in range(n_steps):
+                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
+                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
+                    curv.append(0.0)
+
+            elif seg_type == 1:
+                # Curved bend
+                radius, angle_deg = measures
+                arc_length = radius * abs(np.radians(angle_deg))
+                n_steps    = max(1, int(arc_length / ds_length))
+                d_theta    = np.radians(angle_deg) / n_steps
+                C_step     = d_theta / ds_length   # curvature = dθ/ds
+
+                for _ in range(n_steps):
+                    theta += d_theta
+                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
+                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
+                    curv.append(C_step)
+
+            else:
+                raise ValueError(f"Unknown segment type '{seg_type}'. Use 0 (straight) or 1 (bend).")
+
+        self.xc   = np.array(x_cl)
+        self.yc   = np.array(y_cl)
+        self.curv = np.array(curv)
+
+        # KD-tree on centreline for boundary enforcement
+        self.centerline_tree = cKDTree(np.column_stack((self.xc, self.yc)))
+
+        # ------------------------------------------------------------------
+        # Build 2D grid and flow field
+        # ------------------------------------------------------------------
+        N = len(self.xc)
+
+        # Local tangent angle at every centreline point
+        tangents = np.arctan2(np.gradient(self.yc), np.gradient(self.xc))
+
+        # Cross-section sample points (symmetric about centreline)
+        n_vals, self.dn = np.linspace(-width / 2, width / 2, n_width, retstep=True)
+
+        # Initialise visualisation arrays
+        self.vis_x  = np.zeros((N, n_width))
+        self.vis_y  = np.zeros((N, n_width))
+        self.vis_v  = np.zeros((N, n_width))
+        self.vis_vn = np.zeros((N, n_width))
+
+
+        # Curvature with phase lag: velocity asymmetry in a bend peaks slightly
+        # downstream of the bend apex (helical flow takes time to develop).
+        # The lag is scaled to the dominant bend radius in the river so it
+        # stays physically meaningful regardless of ds_length or river scale.
+        #
+        # Typical field value: lag ≈ 0.5–1.0 × bend_radius
+        # We estimate the bend radius from the maximum curvature: R = 1/|C_max|
+        # and express the lag as a fraction of that.
+        c_max = np.max(np.abs(self.curv)) if np.any(self.curv != 0) else 1e-6
+        r_dominant    = 1.0 / max(c_max, 1e-6)          # dominant bend radius (m)
+        lag_metres    = 0.3 * r_dominant                 # lag = 30% of bend radius
+        lag_steps     = max(1, int(lag_metres / ds_length))
+        smooth_sigma  = max(1.0, lag_steps * 0.3)        # smooth over ~30% of lag
+ 
+        lagged_curv = gaussian_filter1d(np.roll(self.curv, lag_steps), sigma=smooth_sigma)
+
+        grid_coords = []
+        grid_data   = []
+
+        for i in range(N):
+            angle = tangents[i]
+
+            # Unit tangent (streamwise) and normal (cross-stream) vectors
+            tx, ty = np.cos(angle),  np.sin(angle)
+            nx, ny = -np.sin(angle), np.cos(angle)
+
+            # Negate so that positive curvature = left bend → outer bank on left
+            C_local = -lagged_curv[i - 1]
+
+            for j, n in enumerate(n_vals):
+                # Grid cell centre coordinates
+                px = self.xc[i] + nx * n
+                py = self.yc[i] + ny * n
+
+                # Streamwise speed: faster on outer bank in a bend
+                perturbation = 0.7 * C_local * n
+                u_stream = max(0.0, u_avg * (1.0 + perturbation))
+
+                # Secondary (cross-stream) flow driven by centrifugal acceleration
+                u_sec = alpha_secondary * C_local * u_stream
+
+                # Combine into a single velocity vector, then extract magnitude + angle
+                vx = u_stream * tx + u_sec * nx
+                vy = u_stream * ty + u_sec * ny
+
+                speed = np.sqrt(vx**2 + vy**2)
+                angle_out = np.arctan2(vy, vx)
+
+                grid_coords.append([px, py])
+                grid_data.append([speed, angle_out])
+
+                self.vis_x[i, j]  = px
+                self.vis_y[i, j]  = py
+                self.vis_v[i, j]  = u_stream
+                self.vis_vn[i, j] = u_sec
+
+        self.grid_data   = np.array(grid_data)
+        self.physics_tree = cKDTree(grid_coords)
+
+
+# =============================================================================
+# LagrangianParticles
+
+
+# =============================================================================
+# LagrangianParticles
+# =============================================================================
+
+class LagrangianParticles:
+    """
+    Stochastic Lagrangian particle tracker for contaminant plume simulation.
+
+    Particles are advected by the local flow field and dispersed by
+    random-walk diffusion in both the streamwise and cross-stream directions.
+
+    Parameters
+    ----------
+    river : River
+        The river model providing the flow field.
+    num_particles : int
+        Number of tracer particles to release.
+    x0, y0 : float
+        Release coordinates (metres, local river frame).
+    D_L : float
+        Longitudinal (streamwise) diffusion coefficient (m²/s).
+    D_T : float
+        Transverse (cross-stream) diffusion coefficient (m²/s).
+    """
+
+    def __init__(
+        self,
+        river: River,
+        num_particles: int,
+        x0: float,
+        y0: float,
+        D_L: float,
+        D_T: float,
+    ):
+        self.river = river
+        self.num   = num_particles
+        self.D_L   = D_L
+        self.D_T   = D_T
+
+        # Scatter the initial release around (x0, y0) with a small Gaussian spread
+        self.x = np.full(num_particles, x0) + np.random.normal(0, 0.5, num_particles)
+        self.y = np.full(num_particles, y0) + np.random.normal(0, 0.5, num_particles)
+
+    # ------------------------------------------------------------------
+
+    def update(self, dt: float):
+        """
+        Advance all particles by one time step dt (seconds).
+
+        Steps:
+          1. Look up the nearest grid cell velocity for each particle.
+          2. Advect along the streamwise direction.
+          3. Add Gaussian random-walk noise in both L and T directions.
+          4. Rotate displacement from (L, T) frame back to (x, y).
+          5. Enforce channel boundaries (elastic clamp).
+        """
+        points = np.column_stack((self.x, self.y))
+
+        # Nearest grid cell → local speed and flow angle
+        _, indices = self.river.physics_tree.query(points, k=1)
+        cell_data   = self.river.grid_data[indices]
+        U_local     = cell_data[:, 0]
+        theta_local = cell_data[:, 1]
+
+        # Streamwise advection + longitudinal diffusion
+        dL = U_local * dt + np.random.normal(0, 1, self.num) * np.sqrt(2 * self.D_L * dt)
+
+        # Transverse diffusion only (no mean cross-stream flow for particles)
+        dT = np.random.normal(0, 1, self.num) * np.sqrt(2 * self.D_T * dt)
+
+        # Rotate from local (L, T) frame to global (x, y) frame
+        c = np.cos(theta_local)
+        s = np.sin(theta_local)
+        self.x += dL * c - dT * s
+        self.y += dL * s + dT * c
+
+        self._enforce_boundaries()
+
+    # ------------------------------------------------------------------
+
+    def _enforce_boundaries(self):
+        """
+        Clamp particles that have escaped outside the channel banks.
+
+        Any particle further than 95% of the half-width from the nearest
+        centreline point is pushed back to that limit along the radial direction.
+        """
+        points = np.column_stack((self.x, self.y))
+        dists, indices = self.river.centerline_tree.query(points, k=1)
+
+        limit = self.river.half_width * 0.95
+        oob   = dists > limit
+
+        if not np.any(oob):
+            return
+
+        cx = self.river.xc[indices[oob]]
+        cy = self.river.yc[indices[oob]]
+        px = self.x[oob]
+        py = self.y[oob]
+
+        # Radial vector from centreline point to particle
+        vx = px - cx
+        vy = py - cy
+        norm = np.sqrt(vx**2 + vy**2)
+        norm[norm == 0] = 1.0   # guard against zero-length vector
+
+        # Push back to the boundary
+        self.x[oob] = cx + (vx / norm) * limit
+        self.y[oob] = cy + (vy / norm) * limit
+
+
+# =============================================================================
+# BuoyParticle
+# =============================================================================
+
+class BuoyParticle:
+    """
+    Single passive surface float advected by the river flow field.
+
+    Uses identical boundary enforcement to LagrangianParticles — nearest
+    centreline query + radial push-back — so the buoy cannot escape the
+    channel at bends.  A small cross-stream random walk is added to
+    simulate surface turbulence (realistic for a real buoy on a river).
+
+    Parameters
+    ----------
+    river : River
+    x0, y0 : float   Initial position in local river frame (metres).
+    D_T : float       Transverse diffusion coefficient (m²/s) for surface noise.
+    """
+
+    def __init__(self, river: River, x0: float, y0: float, D_T: float = 0.5):
+        self.river = river
+        self.D_T   = D_T
+        self.x     = float(x0)
+        self.y     = float(y0)
+
+    def update(self, dt: float):
+        """
+        Advance the buoy by one time step dt (seconds).
+
+        1. Look up local velocity at the buoy's current position.
+        2. Advect downstream by speed × dt.
+        3. Add small Gaussian cross-stream displacement (surface turbulence).
+        4. Apply radial boundary clamp — identical logic to LagrangianParticles.
+        """
+        # 1. Local velocity
+        pts = np.array([[self.x, self.y]])
+        _, idx = self.river.physics_tree.query(pts, k=1)
+        speed, angle = self.river.grid_data[int(idx[0])]
+
+        # 2. Downstream advection
+        dx = speed * dt * np.cos(angle)
+        dy = speed * dt * np.sin(angle)
+
+        # 3. Cross-stream surface turbulence
+        noise = np.random.normal(0, np.sqrt(2 * self.D_T * dt))
+        dx   += noise * (-np.sin(angle))
+        dy   += noise * ( np.cos(angle))
+
+        self.x += dx
+        self.y += dy
+
+        # 4. Radial boundary clamp
+        self._enforce_boundaries()
+
+    def _enforce_boundaries(self):
+        """Push buoy back inside the channel if it has crossed a bank."""
+        pts          = np.array([[self.x, self.y]])
+        dist, cl_idx = self.river.centerline_tree.query(pts, k=1)
+        dist         = float(dist[0])
+        cl_idx       = int(cl_idx[0])
+        limit        = self.river.half_width * 0.95
+
+        if dist <= limit:
+            return
+
+        cx   = self.river.xc[cl_idx]
+        cy   = self.river.yc[cl_idx]
+        vx   = self.x - cx
+        vy   = self.y - cy
+        norm = np.sqrt(vx**2 + vy**2)
+        if norm > 1e-9:
+            self.x = cx + (vx / norm) * limit
+            self.y = cy + (vy / norm) * limit
+
+    def reset(self, x0: float, y0: float):
+        """Return buoy to a given start position."""
+        self.x = float(x0)
+        self.y = float(y0)
+
+    @property
+    def position(self) -> tuple[float, float]:
+        return (self.x, self.y)
+
+
+# =============================================================================
+# DVsolver
+# =============================================================================
+
+class DVsolver:
+    """
+    Steady-state advection-diffusion solver for contamination plume display.
+
+        ∇·(u c) - ∇·(D ∇c) = q
+
+    Solves directly for the time-independent concentration field — no
+    time-stepping needed.  This gives a permanent plume shape that stays
+    anchored to the source and never drifts away.
+
+    Boundary conditions
+    -------------------
+    Upstream (x=0)  : Neumann (no-flux) — contamination cannot re-enter
+    Downstream (x=L): Dirichlet c=0    — concentration exits freely
+    Banks (y=±W/2)  : Neumann (no-flux) — impermeable banks
+
+    With a zero-concentration outlet, the steady-state solution exists and
+    is unique.  The plume extends downstream from the source and decays to
+    zero at the outlet — exactly what you want to visualise.
+
+    Parameters
+    ----------
+    river : River
+    source_coords : [x, y]      Local coords of the pollution source.
+    source_intensity : float    Source strength (concentration·m²/s).
+    diffusion : float            Isotropic diffusion coefficient D (m²/s).
+    step : float                 Unused — kept for API compatibility.
+    """
+
+    def __init__(
+        self,
+        river: River,
+        source_coords: list,
+        source_intensity: float,
+        diffusion: float,
+        step: float,           # kept for API compatibility, not used
+    ):
+        self.river = river
+
+        n_stream = len(river.vis_x)
+        n_cross  = len(river.vis_x[0])
+
+        hx = np.ones(n_stream) * river.ds_length
+        hy = np.ones(n_cross)  * river.dn
+        self.mesh = TensorMesh([hx, hy], x0='0C')
+
+        # ------------------------------------------------------------------
+        # Face-normal velocity field
+        # ------------------------------------------------------------------
+        vx_cc    = river.vis_v.flatten(order='F')
+        vy_cc    = river.vis_vn.flatten(order='F')
+        Av       = self.mesh.average_cell_to_face
+        ux_faces = (Av @ vx_cc)[:self.mesh.nFx]
+        uy_faces = (Av @ vy_cc)[self.mesh.nFx:]
+        self.u   = np.r_[ux_faces, uy_faces]
+
+        # ------------------------------------------------------------------
+        # Point source
+        # ------------------------------------------------------------------
+        xy_cc   = self.mesh.gridCC
+        dist_sq = ((xy_cc[:, 0] - source_coords[0])**2 +
+                   (xy_cc[:, 1] - source_coords[1])**2)
+        k       = np.argmin(dist_sq)
+        q       = np.zeros(self.mesh.nC)
+        q[k]    = source_intensity
+
+        # ------------------------------------------------------------------
+        # Steady-state operator  M·p = s
+        #
+        # BCs: Neumann on upstream + both banks, Dirichlet=0 on downstream.
+        # In discretize the BC string order is [x_min, x_max] for the gradient
+        # operator.  "neumann" = free (natural), "dirichlet" = zero value.
+        # ------------------------------------------------------------------
+        a            = mkvc(diffusion * np.ones(self.mesh.nC))
+        Afc          = self.mesh.dim * self.mesh.aveF2CC
+        Mf_inv       = self.mesh.get_face_inner_product(invert_matrix=True)
+        Mc           = sdiag(self.mesh.cell_volumes)
+        Mc_inv       = sdiag(1.0 / self.mesh.cell_volumes)
+        Mf_alpha_inv = self.mesh.get_face_inner_product(
+            a, invert_model=True, invert_matrix=True
+        )
+
+        # Neumann upstream (x_min), Dirichlet downstream (x_max), Neumann banks
+        self.mesh.set_cell_gradient_BC(["neumann", "dirichlet"])
+        G = self.mesh.cell_gradient
+        D = self.mesh.face_divergence
+
+        # Steady-state advection-diffusion operator
+        M_ss = -D * Mf_alpha_inv * G * Mc + Afc * sdiag(self.u) * Mf_inv * G * Mc
+
+        self.s    = Mc_inv * q          # RHS = source
+        self.M_lu = splu(M_ss.tocsc())  # factorise once
+
+        # Solve for steady-state concentration immediately
+        self.p = self.M_lu.solve(self.s)
+        self.p = np.maximum(self.p, 0.0)
+
+    def update(self) -> np.ndarray:
+        """
+        No-op for the steady-state solver — the plume is already solved.
+        Kept so simulation.py can call update() without branching.
+        Returns the fixed concentration map.
+        """
+        return self.get_concentration_map()
+
+    def move_source(self, source_coords: list):
+        """
+        Re-solve with a new source location without rebuilding the operator.
+        Useful for interactive contamination injection.
+        """
+        xy_cc   = self.mesh.gridCC
+        dist_sq = ((xy_cc[:, 0] - source_coords[0])**2 +
+                   (xy_cc[:, 1] - source_coords[1])**2)
+        k       = np.argmin(dist_sq)
+        q       = np.zeros(self.mesh.nC)
+        q[k]    = self.s.max() * self.mesh.cell_volumes[k]  # preserve intensity
+        Mc_inv  = sdiag(1.0 / self.mesh.cell_volumes)
+        self.s  = Mc_inv * q
+        self.p  = np.maximum(self.M_lu.solve(self.s), 0.0)
+
+    def get_concentration_map(self) -> np.ndarray:
+        """Return the steady-state concentration field as (N_stream, N_width)."""
+        return self.p.reshape(
+            (self.mesh.shape_cells[0], self.mesh.shape_cells[1]), order='F'
+        )
+
+
+# =============================================================================
+# AdjointDVsolver
+# =============================================================================
+
+class AdjointDVsolver:
+    """
+    Adjoint (time-reversed) advection-diffusion solver.
+
+    Negates the velocity field and continuously injects at the detection point,
+    exactly mirroring how DVsolver works in the forward direction.  Each call
+    to update() adds more mass at the detection location and steps one tick
+    further back in physical time — producing a growing upstream plume.
+
+    Parameters
+    ----------
+    river : River
+    detection_coords : [x, y]   Local coords of the detection point.
+    diffusion : float            Diffusion coefficient D (m²/s).
+    step : float                 Time step dt (seconds).
+    source_intensity : float     Continuous injection strength (same units as DVsolver).
+    """
+
+    def __init__(
+        self,
+        river:             River,
+        detection_coords:  list,
+        diffusion:         float,
+        step:              float,
+        source_intensity:  float = 10.0,
+    ):
+        self.river = river
+        self.step  = step
+        self.tau   = 0.0
+
+        n_stream = len(river.vis_x)
+        n_cross  = len(river.vis_x[0])
+        self.n_stream = n_stream
+        self.n_cross  = n_cross
+
+        hx = np.ones(n_stream) * river.ds_length
+        hy = np.ones(n_cross)  * river.dn
+        self.mesh = TensorMesh([hx, hy], x0='0C')
+
+        # Negate velocity field — adjoint operation
+        vx_cc    = -river.vis_v.flatten(order='F')
+        vy_cc    = -river.vis_vn.flatten(order='F')
+        Av       = self.mesh.average_cell_to_face
+        ux_faces = (Av @ vx_cc)[:self.mesh.nFx]
+        uy_faces = (Av @ vy_cc)[self.mesh.nFx:]
+        u_adj    = np.r_[ux_faces, uy_faces]
+
+        # Continuous source at detection point
+        xy_cc   = self.mesh.gridCC
+        dist_sq = ((xy_cc[:, 0] - detection_coords[0])**2 +
+                   (xy_cc[:, 1] - detection_coords[1])**2)
+        k         = np.argmin(dist_sq)
+        q         = np.zeros(self.mesh.nC)
+        q[k]      = source_intensity
+
+        # System matrix — same structure as DVsolver, negated velocity
+        a            = mkvc(diffusion * np.ones(self.mesh.nC))
+        Afc          = self.mesh.dim * self.mesh.aveF2CC
+        Mf_inv       = self.mesh.get_face_inner_product(invert_matrix=True)
+        Mc           = sdiag(self.mesh.cell_volumes)
+        Mc_inv       = sdiag(1.0 / self.mesh.cell_volumes)
+        Mf_alpha_inv = self.mesh.get_face_inner_product(
+            a, invert_model=True, invert_matrix=True
+        )
+        self.mesh.set_cell_gradient_BC(["neumann", "neumann"])
+        G  = self.mesh.cell_gradient
+        D  = self.mesh.face_divergence
+        M  = -D * Mf_alpha_inv * G * Mc + Afc * sdiag(u_adj) * Mf_inv * G * Mc
+        I  = sdiag(np.ones(self.mesh.nC))
+        B  = I + step * M
+
+        # Start from zero — plume grows from nothing
+        self.p    = np.zeros(self.mesh.nC)
+        self.s    = Mc_inv * q   # continuous source term
+        self.B_lu = splu(B)
+
+    def update(self) -> np.ndarray:
+        """
+        Advance one step — injects source and propagates upstream.
+        Returns the current normalised probability map (N_stream, N_width).
+        """
+        self.p    = self.B_lu.solve(self.p + self.s)
+        self.p    = np.maximum(self.p, 0.0)
+        self.tau += self.step
+        return self.get_probability_map()
+
+    def get_probability_map(self) -> np.ndarray:
+        """Current concentration as a normalised (N_stream, N_width) array."""
+        raw   = self.p.reshape((self.n_stream, self.n_cross), order='F')
+        total = raw.sum()
+        return raw / total if total > 1e-12 else raw
