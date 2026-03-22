@@ -15,7 +15,7 @@ This enabled us to do the following
 
 The second point is important if we want to use particle simulation to backtrack the source of the detected contamination. 
 
-* My vision for the backtrack method btw: 
+My vision for the backtrack method btw: 
 When contamination is detected by the bouy, we start a reverse affection diffusion simulation with that point as the source.
 Three important qualities of our situation could help with the effectiveness of this method :
 
