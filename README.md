@@ -26,7 +26,7 @@ Three important qualities of our situation could help with the effectiveness of 
 - We operate in relativly wide rivers with relativly high velocity, this would result in that the spread of the contamination will not be as major as in the shown dias of the presentation (if source is not massive ig).
 
 
-In this project i (and ai :>) tried to implment the above Thought.
+In this project we (and ai :>) tried to impelment the above Thought.
 
 
 Ofcourse having a way to physically steer the board against the current and running this simulation multiple times until the contamination is not sensed anmore will pinpoint the location better.
