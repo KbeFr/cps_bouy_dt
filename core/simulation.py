@@ -12,7 +12,7 @@ import config
 from core.georef import GeoReference
 
 try:
-    from core.river_model import River, LagrangianParticles, DVsolver, BuoyParticle, AdjointDVsolver
+    from core.river_model import River, LagrangianParticles, DVsolver, BuoyParticle
     _MODEL_AVAILABLE = True
 except ImportError:
     _MODEL_AVAILABLE = False
@@ -125,7 +125,7 @@ class SimulationState:
         Step 2: place the buoy at a GPS position clicked on the map.
         Converts to local coords and stores as the start position.
         """
-        if not self.georef.is_set:
+        if not self.georef._is_set:
             print("[Simulation] Cannot set buoy start — georef not set")
             return
 
@@ -157,7 +157,7 @@ class SimulationState:
 
         if topology is not None:
             topo = topology
-        elif self.georef.is_set:
+        elif self.georef._is_set:
             topo = self.georef.to_river_topology(
                 bend_radius    = bend_radius,
                 merge_window_m = kwargs.get("merge_window_m", config.DEFAULT_MERGE_WINDOW_M),
@@ -166,10 +166,15 @@ class SimulationState:
         else:
             topo = config.DEFAULT_TOPOLOGY
 
+
+        #feed topology to georef for discritization and KDtree
+        ds_length       = kwargs.get("ds_length",       config.DEFAULT_DS_L) #needs to be fixed so dynamic based on river lenght!!!!
+        self.georef.build_discretized_tree(topo , ds_length )
+
         self.river = River(
             topology        = topo,
             width           = width,
-            ds_length       = kwargs.get("ds_length",       config.DEFAULT_DS_L),
+            ds_length       = ds_length,
             n_width         = kwargs.get("n_width",         config.DEFAULT_N_WIDTH),
             u_avg           = kwargs.get("u_avg",           config.DEFAULT_U_AVG),
             alpha_secondary = kwargs.get("alpha_secondary", config.DEFAULT_ALPHA_SEC),
@@ -190,6 +195,7 @@ class SimulationState:
             source_intensity = config.DEFAULT_SOURCE_INTENSITY,
             diffusion        = config.DEFAULT_DIFFUSIVITY,
             step             = self.sim_dt,
+            is_adjoint       = False
         )
 
         # Default buoy start: beginning of river centreline
@@ -215,9 +221,10 @@ class SimulationState:
 
         self.sim_time += 1
 
-        # Advance physics
-        self.plume.update(self.sim_dt)
-        self.dv.update()
+        # Advance physics, not really used
+
+        #self.plume.update(self.sim_dt)
+        #self.dv.update()
 
         # Advance buoy
         if self.mode == self.MODE_SIMULATED:
@@ -226,8 +233,8 @@ class SimulationState:
             self._advance_buoy_real()
 
         # Convert local → GPS and record track
-        if self.georef.is_set:
-            lat, lon = self.georef.sim_cartesian_to_gps(self.buoy_local_x, self.buoy_local_y, self.river)
+        if self.georef._is_set:
+            lat, lon = self.georef.sim_cartesian_to_gps(self.buoy_local_x, self.buoy_local_y)
             self.buoy_gps_lat = lat
             self.buoy_gps_lon = lon
             self.buoy_history_gps.append((lat, lon))
@@ -251,7 +258,7 @@ class SimulationState:
         """Sync buoy position from live ThingsBoard GPS."""
         lat = self.sensor.get("latitude")
         lon = self.sensor.get("longitude")
-        if lat and lon and self.georef.is_set:
+        if lat and lon and self.georef._is_set:
             self.buoy_gps_lat = lat
             self.buoy_gps_lon = lon
             x, y = self.georef.gps_to_local(lat, lon)
@@ -283,14 +290,16 @@ class SimulationState:
         if self.river is None:
             print("[Simulation] Cannot backtrack — river not built")
             return
-        self.contamination_local = (self.buoy_local_x, self.buoy_local_y)
-        self.adjoint = AdjointDVsolver(
+        self.contamination_local = [self.buoy_local_x, self.buoy_local_y]
+        self.adjoint = DVsolver(
             river            = self.river,
-            detection_coords = list(self.contamination_local),
-            diffusion        = config.DEFAULT_DIFFUSIVITY,
-            step             = 50,
+            source_coords = self.contamination_local,
+            source_intensity = config.DEFAULT_SOURCE_INTENSITY_BACK,
+            diffusion        = config.DEFAULT_DIFFUSIVITY_BACK,
+            step             = 30,
+            is_adjoint       = True
         )
-        self.backtrack_map = self.adjoint.get_probability_map()
+        self.backtrack_map = self.adjoint.get_concentration_map()
         self.backtracking  = True
         print(f"[Simulation] Backtrack started from "
               f"({self.contamination_local[0]:.1f}, {self.contamination_local[1]:.1f})")
@@ -327,9 +336,9 @@ class SimulationState:
     # ------------------------------------------------------------------
 
     def get_river_overlay_gps(self) -> list[tuple]:
-        if self.river is None or not self.georef.is_set:
+        if self.river is None or not self.georef._is_set:
             return []
-        return self.georef.river_centerline_as_gps(self.river.xc)
+        return self.georef.river_centerline_as_gps()
 
     def get_concentration_map(self):
         if self.dv is None:

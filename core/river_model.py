@@ -444,7 +444,8 @@ class DVsolver:
         source_coords: list,
         source_intensity: float,
         diffusion: float,
-        step: float,           # kept for API compatibility, not used
+        step: float,
+        is_adjoint : bool           
     ):
         self.river = river
 
@@ -458,67 +459,101 @@ class DVsolver:
         # ------------------------------------------------------------------
         # Face-normal velocity field
         # ------------------------------------------------------------------
-        vx_cc    = river.vis_v.flatten(order='F')
-        vy_cc    = river.vis_vn.flatten(order='F')
-        Av       = self.mesh.average_cell_to_face
-        ux_faces = (Av @ vx_cc)[:self.mesh.nFx]
-        uy_faces = (Av @ vy_cc)[self.mesh.nFx:]
-        self.u   = np.r_[ux_faces, uy_faces]
+        
+        #convert to face vector
+        direction = -1.0 if is_adjoint else 1.0
 
+        vx_cc = (river.vis_v * direction).flatten(order='F')
+        vy_cc = (river.vis_vn * direction).flatten(order='F')        
+        # Get the averaging matrix
+        Av = self.mesh.average_cell_to_face
+        
+        # A. Map X-velocity to all faces, but keep only the X-faces (first nFx)
+        # This gives us u_x on the vertical interfaces
+        ux_on_all_faces = Av @ vx_cc
+        ux_faces = ux_on_all_faces[:self.mesh.nFx]
+        
+        # B. Map Y-velocity to all faces, but keep only the Y-faces (last nFy)
+        # This gives us u_y on the horizontal interfaces
+        uy_on_all_faces = Av @ vy_cc
+        uy_faces = uy_on_all_faces[self.mesh.nFx:]
+        
+        # C. Combine them into the final face-normal velocity vector
+        self.u = np.r_[ux_faces, uy_faces]
+        
         # ------------------------------------------------------------------
         # Point source
         # ------------------------------------------------------------------
-        xy_cc   = self.mesh.gridCC
-        dist_sq = ((xy_cc[:, 0] - source_coords[0])**2 +
-                   (xy_cc[:, 1] - source_coords[1])**2)
-        k       = np.argmin(dist_sq)
-        q       = np.zeros(self.mesh.nC)
-        q[k]    = source_intensity
+        
+        #  Find the nearest cell in the river's Cartesian physics tree
+        _, idx_c = self.river.physics_tree.query([source_coords], k=1)
+        idx_c = int(idx_c[0])
+
+        # Map the C-order flat index (from tree) to Fortran-order  (for TensorMesh)
+        # Row-Major to Column-Major !!
+
+        # i is the streamwise index, j is the cross-stream index
+        i = idx_c // n_cross
+        j = idx_c % n_cross
+
+        # TensorMesh flattens using Fortran order (streamwise varies fastest)
+        k = j * n_stream + i
+
+        #Make the point source 1 in array
+        q = np.zeros(self.mesh.nC)
+        q[k] = source_intensity
 
         # ------------------------------------------------------------------
         # Steady-state operator  M·p = s
-        #
-        # BCs: Neumann on upstream + both banks, Dirichlet=0 on downstream.
-        # In discretize the BC string order is [x_min, x_max] for the gradient
-        # operator.  "neumann" = free (natural), "dirichlet" = zero value.
+        # "neumann" = free (natural), "dirichlet" = zero value.
         # ------------------------------------------------------------------
-        a            = mkvc(diffusion * np.ones(self.mesh.nC))
-        Afc          = self.mesh.dim * self.mesh.aveF2CC
-        Mf_inv       = self.mesh.get_face_inner_product(invert_matrix=True)
-        Mc           = sdiag(self.mesh.cell_volumes)
-        Mc_inv       = sdiag(1.0 / self.mesh.cell_volumes)
-        Mf_alpha_inv = self.mesh.get_face_inner_product(
-            a, invert_model=True, invert_matrix=True
-        )
+        
+        # Define diffusivity within each cell
+        a = mkvc(diffusion * np.ones(self.mesh.nC))
 
-        # Neumann upstream (x_min), Dirichlet downstream (x_max), Neumann banks
-        self.mesh.set_cell_gradient_BC(["neumann", "dirichlet"])
+
+        # Define the matrix M
+        Afc = self.mesh.dim * self.mesh.aveF2CC  # modified averaging operator to sum dot product
+        Mf_inv = self.mesh.get_face_inner_product(invert_matrix=True)
+        Mc = sdiag(self.mesh.cell_volumes)
+        Mc_inv = sdiag(1 / self.mesh.cell_volumes)
+        Mf_alpha_inv = self.mesh.get_face_inner_product(a, invert_model=True, invert_matrix=True)
+
+
+        self.mesh.set_cell_gradient_BC(["neumann", "neumann"])  # Set Neumann BC
         G = self.mesh.cell_gradient
         D = self.mesh.face_divergence
 
+
         # Steady-state advection-diffusion operator
-        M_ss = -D * Mf_alpha_inv * G * Mc + Afc * sdiag(self.u) * Mf_inv * G * Mc
+        M = -D * Mf_alpha_inv * G * Mc + Afc * sdiag(self.u) * Mf_inv * G * Mc
+        
+        
+        self.p = np.zeros(self.mesh.nC)  # Initial conditions p(t=0)=0
 
-        self.s    = Mc_inv * q          # RHS = source
-        self.M_lu = splu(M_ss.tocsc())  # factorise once
+        I = sdiag(np.ones(self.mesh.nC))  # Identity matrix
+        B = I + step * M
+        self.s = Mc_inv * q
 
-        # Solve for steady-state concentration immediately
-        self.p = self.M_lu.solve(self.s)
-        self.p = np.maximum(self.p, 0.0)
+        self.Binv = splu(B)
+
 
     def update(self) -> np.ndarray:
-        """
-        No-op for the steady-state solver — the plume is already solved.
-        Kept so simulation.py can call update() without branching.
-        Returns the fixed concentration map.
-        """
-        return self.get_concentration_map()
+        self.p = self.Binv.solve(self.p + self.s)
 
+        # I would think that p is a 1D array with every value of the DV for every cell of the river in it. 
+        # How the cells are indext i think is first for the first x-axis all the y-axis values are defined then we traverse like this
+        # so if we want to "bend" the shape back into the river we would need to compact the [L*W] matrix to [L,W] indexxed matrix, then we can use pcolormesh like we did before
+
+        # Reshape the solution column first and return
+        return self.p.reshape((self.mesh.shape_cells[0], self.mesh.shape_cells[1]), order='F') 
+
+    """ BROKEN
     def move_source(self, source_coords: list):
-        """
-        Re-solve with a new source location without rebuilding the operator.
-        Useful for interactive contamination injection.
-        """
+        
+        ##Re-solve with a new source location without rebuilding the operator.
+        ##Useful for interactive contamination injection.
+        
         xy_cc   = self.mesh.gridCC
         dist_sq = ((xy_cc[:, 0] - source_coords[0])**2 +
                    (xy_cc[:, 1] - source_coords[1])**2)
@@ -528,106 +563,10 @@ class DVsolver:
         Mc_inv  = sdiag(1.0 / self.mesh.cell_volumes)
         self.s  = Mc_inv * q
         self.p  = np.maximum(self.M_lu.solve(self.s), 0.0)
-
+    """
     def get_concentration_map(self) -> np.ndarray:
         """Return the steady-state concentration field as (N_stream, N_width)."""
-        return self.p.reshape(
-            (self.mesh.shape_cells[0], self.mesh.shape_cells[1]), order='F'
-        )
+        return self.p.reshape((self.mesh.shape_cells[0], self.mesh.shape_cells[1]), order='F') 
 
+    
 
-# =============================================================================
-# AdjointDVsolver
-# =============================================================================
-
-class AdjointDVsolver:
-    """
-    Adjoint (time-reversed) advection-diffusion solver.
-
-    Negates the velocity field and continuously injects at the detection point,
-    exactly mirroring how DVsolver works in the forward direction.  Each call
-    to update() adds more mass at the detection location and steps one tick
-    further back in physical time — producing a growing upstream plume.
-
-    Parameters
-    ----------
-    river : River
-    detection_coords : [x, y]   Local coords of the detection point.
-    diffusion : float            Diffusion coefficient D (m²/s).
-    step : float                 Time step dt (seconds).
-    source_intensity : float     Continuous injection strength (same units as DVsolver).
-    """
-
-    def __init__(
-        self,
-        river:             River,
-        detection_coords:  list,
-        diffusion:         float,
-        step:              float,
-        source_intensity:  float = 10.0,
-    ):
-        self.river = river
-        self.step  = step
-        self.tau   = 0.0
-
-        n_stream = len(river.vis_x)
-        n_cross  = len(river.vis_x[0])
-        self.n_stream = n_stream
-        self.n_cross  = n_cross
-
-        hx = np.ones(n_stream) * river.ds_length
-        hy = np.ones(n_cross)  * river.dn
-        self.mesh = TensorMesh([hx, hy], x0='0C')
-
-        # Negate velocity field — adjoint operation
-        vx_cc    = -river.vis_v.flatten(order='F')
-        vy_cc    = -river.vis_vn.flatten(order='F')
-        Av       = self.mesh.average_cell_to_face
-        ux_faces = (Av @ vx_cc)[:self.mesh.nFx]
-        uy_faces = (Av @ vy_cc)[self.mesh.nFx:]
-        u_adj    = np.r_[ux_faces, uy_faces]
-
-        # Continuous source at detection point
-        xy_cc   = self.mesh.gridCC
-        dist_sq = ((xy_cc[:, 0] - detection_coords[0])**2 +
-                   (xy_cc[:, 1] - detection_coords[1])**2)
-        k         = np.argmin(dist_sq)
-        q         = np.zeros(self.mesh.nC)
-        q[k]      = source_intensity
-
-        # System matrix — same structure as DVsolver, negated velocity
-        a            = mkvc(diffusion * np.ones(self.mesh.nC))
-        Afc          = self.mesh.dim * self.mesh.aveF2CC
-        Mf_inv       = self.mesh.get_face_inner_product(invert_matrix=True)
-        Mc           = sdiag(self.mesh.cell_volumes)
-        Mc_inv       = sdiag(1.0 / self.mesh.cell_volumes)
-        Mf_alpha_inv = self.mesh.get_face_inner_product(
-            a, invert_model=True, invert_matrix=True
-        )
-        self.mesh.set_cell_gradient_BC(["neumann", "neumann"])
-        G  = self.mesh.cell_gradient
-        D  = self.mesh.face_divergence
-        M  = -D * Mf_alpha_inv * G * Mc + Afc * sdiag(u_adj) * Mf_inv * G * Mc
-        I  = sdiag(np.ones(self.mesh.nC))
-        B  = I + step * M
-
-        # Start from zero — plume grows from nothing
-        self.p    = np.zeros(self.mesh.nC)
-        self.s    = Mc_inv * q   # continuous source term
-        self.B_lu = splu(B)
-
-    def update(self) -> np.ndarray:
-        """
-        Advance one step — injects source and propagates upstream.
-        Returns the current normalised probability map (N_stream, N_width).
-        """
-        self.p    = self.B_lu.solve(self.p + self.s)
-        self.p    = np.maximum(self.p, 0.0)
-        self.tau += self.step
-        return self.get_probability_map()
-
-    def get_probability_map(self) -> np.ndarray:
-        """Current concentration as a normalised (N_stream, N_width) array."""
-        raw   = self.p.reshape((self.n_stream, self.n_cross), order='F')
-        total = raw.sum()
-        return raw / total if total > 1e-12 else raw

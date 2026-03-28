@@ -4,6 +4,7 @@
 # =============================================================================
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 METRES_PER_DEG_LAT = 111_320.0
 
@@ -19,352 +20,173 @@ def _flush_group(group_s, group_angles, fallback_radius):
 
 class GeoReference:
     """
-    Two responsibilities:
-      1. Convert a user-drawn GPS polyline into a River topology description.
-      2. Transform between local river coordinates (metres) and GPS (lat/lon).
-
-    Coordinate conventions
-    ----------------------
-    Local x = arc-length distance along the river centreline (metres from start)
-    Local y = offset perpendicular to the centreline (+ = left bank when looking downstream)
-
-    All normal/tangent vectors are computed in metre-space so they are
-    physically correct regardless of the segment's compass heading.
-    (Degree-space normals are distorted because 1° lat ≠ 1° lon in metres.)
+    Coordinates transformations using a Discretized KDTree approach.
+    This guarantees a 1:1 mapping between the simulation's curvilinear grid
+    and the real-world GPS map, eliminating 'zigzag' tracking artifacts.
     """
 
     def __init__(self):
         self.gps_points:   list[tuple]       = []
-        self._cum_s:       np.ndarray | None = None
-        self._total_s:     float             = 0.0
         self._origin_lat:  float             = 0.0
         self._origin_lon:  float             = 0.0
         self._is_set:      bool              = False
-        self._width_gps:   list[tuple]       = []
-        self._width_local: float             = 0.0
+        self._is_built:    bool              = False
+        
+        # Discretized mapping arrays
+        self.ds_length:    float             = 0.0
+        self.xc:           np.ndarray        = np.array([])
+        self.yc:           np.ndarray        = np.array([])
+        self.gps_lats:     np.ndarray        = np.array([])
+        self.gps_lons:     np.ndarray        = np.array([])
+        self.nx_m:         np.ndarray        = np.array([])
+        self.ny_m:         np.ndarray        = np.array([])
+        self.sim_tree:     cKDTree | None    = None
+        self.heading:      float             = 0.0
 
     # ------------------------------------------------------------------
-    # Primary setup
+    # Primary setup & Topology
     # ------------------------------------------------------------------
 
     def set_gps_polyline(self, points: list[tuple]):
-        """Register the GPS centreline polyline (at least 2 points)."""
         if len(points) < 2:
             raise ValueError("Need at least 2 GPS points.")
         self.gps_points  = points
         self._origin_lat = points[0][0]
         self._origin_lon = points[0][1]
-        self._build_arc_length()
         self._is_set = True
 
-    def set_gps_width(self, points: list[tuple]):
-        """Measure river width from a 2-point line drawn across the river."""
-        self._width_gps = points
-        p1, p2 = points[0], points[-1]
-        d_lon = (p1[1] - p2[1]) * metres_per_deg_lon((p1[0] + p2[0]) / 2)
-        d_lat = (p1[0] - p2[0]) * METRES_PER_DEG_LAT
-        self._width_local = float(np.round(np.sqrt(d_lon**2 + d_lat**2), 2))
-
-    def get_local_river_width(self) -> float:
-        return self._width_local
-
-    @property
-    def is_set(self) -> bool:
-        return self._is_set
-
-    # ------------------------------------------------------------------
-    # Topology conversion
-    # ------------------------------------------------------------------
-
-    def to_river_topology(
-        self,
-        bend_radius:    float = 60.0,
-        merge_window_m: float = 400.0,
-        min_angle_deg:  float = 2.0,
-    ) -> list:
-        """
-        Convert the GPS polyline into a River topology list, merging
-        clusters of small consecutive bend events into single clean arcs.
-
-        Parameters
-        ----------
-        bend_radius : float
-            Fallback radius (m) when a group's arc length is negligible.
-        merge_window_m : float
-            Max arc-length span (m) within which consecutive bend events
-            are considered part of the same physical bend.
-        min_angle_deg : float
-            Heading changes below this threshold are ignored (noise filter).
-        """
+    def to_river_topology(self, bend_radius=60.0, merge_window_m=400.0, min_angle_deg=2.0) -> list:
+        """Converts raw GPS polyline to (straight/bend) topology."""
         pts = self.gps_points
-        n   = len(pts)
+        mx = np.array([(lon - self._origin_lon) * metres_per_deg_lon(self._origin_lat) for _, lon in pts])
+        my = np.array([(lat - self._origin_lat) * METRES_PER_DEG_LAT for lat, _ in pts])
 
-        # GPS → flat metres (origin = first point)
-        mx = np.array([(lon - self._origin_lon) * metres_per_deg_lon(self._origin_lat)
-                       for _, lon in pts])
-        my = np.array([(lat - self._origin_lat) * METRES_PER_DEG_LAT
-                       for lat, _ in pts])
+        dx, dy = np.diff(mx), np.diff(my)
+        lengths, headings = np.sqrt(dx**2 + dy**2), np.arctan2(dy, dx)
 
-        dx       = np.diff(mx)
-        dy       = np.diff(my)
-        lengths  = np.sqrt(dx**2 + dy**2)
-        headings = np.arctan2(dy, dx)
+        cum_s = np.zeros(len(pts))
+        for i in range(1, len(pts)): cum_s[i] = cum_s[i - 1] + lengths[i - 1]
 
-        cum_s = np.zeros(n)
-        for i in range(1, n):
-            cum_s[i] = cum_s[i - 1] + lengths[i - 1]
-
-        # Raw bend events at interior vertices
         raw_bends = []
-        for i in range(1, n - 1):
-            delta = headings[i] - headings[i - 1]
-            delta = (delta + np.pi) % (2 * np.pi) - np.pi
-            #if abs(delta) > np.radians(min_angle_deg):
+        for i in range(1, len(pts) - 1):
+            delta = (headings[i] - headings[i - 1] + np.pi) % (2 * np.pi) - np.pi
+            #we could check for max angle diff to merge but it becomes finicky to draw
             raw_bends.append([cum_s[i], delta])
 
-        if not raw_bends:
-            return [(0, float(cum_s[-1]))]
+        if not raw_bends: return [(0, float(cum_s[-1]))]
 
-        # Merge nearby same-sign bends
-        merged       = []
-        group_s      = [raw_bends[0][0]]
-        group_angles = [raw_bends[0][1]]
-
+        merged, group_s, group_angles = [], [raw_bends[0][0]], [raw_bends[0][1]]
         for s, angle in raw_bends[1:]:
-            if (s - group_s[0] <= merge_window_m and
-                    np.sign(angle) == np.sign(group_angles[-1])):
+            if (s - group_s[0] <= merge_window_m): #and np.sign(angle) == np.sign(group_angles[-1])): , this could be good for certain bends but als finicky
                 group_s.append(s)
                 group_angles.append(angle)
             else:
                 merged.append(_flush_group(group_s, group_angles, bend_radius))
-                group_s      = [s]
-                group_angles = [angle]
+                group_s, group_angles = [s], [angle]
         merged.append(_flush_group(group_s, group_angles, bend_radius))
 
-        # Build topology
-        topology = []
-        cursor_s = 0.0
+        topology, cursor_s = [], 0.0
         for s_centre, total_angle_rad, window_len in merged:
-            r        = max(1.0, window_len / max(abs(total_angle_rad), 1e-6))
-            arc_len  = r * abs(total_angle_rad)
-            half_arc = arc_len / 2.0
-
-            straight_len = max(1.0, s_centre - half_arc - cursor_s)
+            r = max(1.0, window_len / max(abs(total_angle_rad), 1e-6))
+            arc_len = r * abs(total_angle_rad)
+            straight_len = max(1.0, s_centre - (arc_len / 2.0) - cursor_s)
             topology.append((0, straight_len))
-            cursor_s = s_centre + half_arc
+            cursor_s = s_centre + (arc_len / 2.0)
             topology.append((1, (r, np.degrees(total_angle_rad))))
 
-        remaining = max(1.0, float(cum_s[-1]) - cursor_s)
-        topology.append((0, remaining))
+        topology.append((0, max(1.0, float(cum_s[-1]) - cursor_s)))
+
         return topology
 
-    def total_length_m(self) -> float:
-        return float(self._total_s)
-
     # ------------------------------------------------------------------
-    # Coordinate transforms
+    # The New Discretized Tree Engine
     # ------------------------------------------------------------------
 
-
+    def build_discretized_tree(self, topology: list, ds_length: float):
+        self.ds_length = ds_length
         
-    def sim_cartesian_to_gps(self, buoy_x: float, buoy_y: float, river) -> tuple[float, float]:
-        """
-        Translates a buoy's flat Cartesian simulation coordinates into real-world GPS.
-        """
-        if not self.is_set:
-            raise RuntimeError("GeoReference polyline must be set first.")
+        # 1. Calculate Initial Real-World Heading from GPS
+        lat0, lon0 = self.gps_points[0]
+        lat1, lon1 = self.gps_points[1]
+        dx = (lon1 - lon0) * metres_per_deg_lon(lat0)
+        dy = (lat1 - lat0) * METRES_PER_DEG_LAT
+        self.heading = np.arctan2(dy, dx)
 
-        # 1. Find the nearest centerline point in the simulation's KDTree
-        dist, idx_array = river.centerline_tree.query([[buoy_x, buoy_y]], k=1)
-        idx = int(idx_array[0])
+        # 2. Build Unrotated Centerline (Matches Simulation Exactly)
+        x_cl, y_cl = [0.0], [0.0]
+        theta = 0.0  
+        
+        for seg_type, measures in topology:
+            if seg_type == 0:
+                n_steps = max(1, int(measures / ds_length))
+                for _ in range(n_steps):
+                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
+                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
+            elif seg_type == 1:
+                radius, angle_deg = measures
+                n_steps = max(1, int((radius * abs(np.radians(angle_deg))) / ds_length))
+                d_theta = np.radians(angle_deg) / n_steps
+                for _ in range(n_steps):
+                    theta += d_theta
+                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
+                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
 
-        # 2. Calculate arc-length (s) down the simulated river
-        # Since the river is built in ds_length steps, arc-length is simply index * ds_length
-        s = idx * river.ds_length
+        self.xc = np.array(x_cl)
+        self.yc = np.array(y_cl)
 
-        # 3. Calculate cross-stream offset (n)
-        cx = river.xc[idx]
-        cy = river.yc[idx]
-        vx = buoy_x - cx
-        vy = buoy_y - cy
+        # 3. Compute normal vectors in Unrotated Space
+        dx_arr = np.gradient(self.xc)
+        dy_arr = np.gradient(self.yc)
+        lengths = np.sqrt(dx_arr**2 + dy_arr**2)
+        lengths[lengths == 0] = 1e-9
+        self.nx_m = -dy_arr / lengths
+        self.ny_m = dx_arr / lengths
 
-        # Get local tangent vector of the simulation centerline to determine left/right bank
-        if idx < len(river.xc) - 1:
-            tx = river.xc[idx + 1] - river.xc[idx]
-            ty = river.yc[idx + 1] - river.yc[idx]
-        else:
-            tx = river.xc[idx] - river.xc[idx - 1]
-            ty = river.yc[idx] - river.yc[idx - 1]
+        # 4. Build KDTree in UNROTATED Simulation Space
+        self.sim_tree = cKDTree(np.column_stack((self.xc, self.yc)))
 
-        # Create left-pointing normal vector
-        length = np.sqrt(tx**2 + ty**2)
-        if length < 1e-9:
-            nx, ny = 0.0, 0.0
-        else:
-            nx = -ty / length
-            ny = tx / length
+        # 5. Pre-calculate GPS coords (Apply Rotation to World Space)
+        c, s = np.cos(self.heading), np.sin(self.heading)
+        x_rot = self.xc * c - self.yc * s
+        y_rot = self.xc * s + self.yc * c
 
-        # Signed distance (dot product with normal) to get left/right offset
-        n = vx * nx + vy * ny
-
-        # 4. Let your existing function do the heavy lifting!
-        # It will correctly map the arc-length and offset to the true GPS headings.
-        return self.local_to_gps(float(s), float(n))
-
-
-
-    def local_to_gps(self, x: float, y: float) -> tuple[float, float]:
-        """
-        Local river coords (x along stream, y across) → (lat, lon).
- 
-        Normal vectors are blended smoothly at segment junctions so the GPS
-        position never jumps as the buoy crosses from one polyline segment to
-        the next.  Without blending, a cross-stream offset y produces a
-        discontinuous position jump at every vertex (clearly visible as
-        zigzagging in the GPS track).
- 
-        Blending strategy
-        -----------------
-        For each interior vertex we compute an averaged normal from the two
-        adjacent segments.  When x lies within one segment, we blend linearly
-        between the vertex normal at the start of the segment and the vertex
-        normal at the end, weighted by t (position within segment).  This gives
-        a C0-continuous normal field along the whole polyline.
-        """
-        if not self._is_set:
-            raise RuntimeError("Call set_gps_polyline() first.")
- 
-        pts = self.gps_points
-        n   = len(pts)
- 
-        # ------------------------------------------------------------------
-        # Build per-segment unit tangents and per-vertex blended normals
-        # (done each call — cheap for typical polyline lengths of 5-30 pts)
-        # ------------------------------------------------------------------
-        def _seg_tangent_m(i):
-            """Unit tangent of segment i in metre-space."""
-            lat0, lon0 = pts[i]
-            lat1, lon1 = pts[i + 1]
-            mid_lat    = (lat0 + lat1) / 2
-            dx = (lon1 - lon0) * metres_per_deg_lon(mid_lat)
-            dy = (lat1 - lat0) * METRES_PER_DEG_LAT
-            L  = np.sqrt(dx**2 + dy**2)
-            if L < 1e-9:
-                return np.array([1.0, 0.0])
-            return np.array([dx / L, dy / L])
- 
-        def _normal_from_tangent(t):
-            """90° CCW rotation → left-bank normal."""
-            return np.array([-t[1], t[0]])
- 
-        # Unit normal for every segment
-        seg_normals = [_normal_from_tangent(_seg_tangent_m(i)) for i in range(n - 1)]
- 
-        # Blended normal at every vertex (average of neighbouring segments,
-        # normalised).  End vertices use the single adjacent segment's normal.
-        def _vertex_normal(v):
-            if v == 0:
-                return seg_normals[0]
-            if v == n - 1:
-                return seg_normals[-1]
-            avg = seg_normals[v - 1] + seg_normals[v]
-            L   = np.linalg.norm(avg)
-            return avg / L if L > 1e-9 else seg_normals[v]
- 
-        # ------------------------------------------------------------------
-        # Find which segment x falls on
-        # ------------------------------------------------------------------
-        x_c = float(np.clip(x, 0, self._total_s))
-        idx = int(np.clip(
-            np.searchsorted(self._cum_s, x_c, side='right') - 1,
-            0, n - 2
-        ))
- 
-        s0, s1 = self._cum_s[idx], self._cum_s[idx + 1]
-        t      = (x_c - s0) / max(s1 - s0, 1e-9)   # 0 = start vertex, 1 = end vertex
- 
-        lat0, lon0 = pts[idx]
-        lat1, lon1 = pts[idx + 1]
- 
-        # Centreline interpolation
-        lat_c = lat0 + t * (lat1 - lat0)
-        lon_c = lon0 + t * (lon1 - lon0)
- 
-        # Blend between the vertex normals at each end of this segment
-        n0 = _vertex_normal(idx)         # normal at start vertex of segment
-        n1 = _vertex_normal(idx + 1)     # normal at end   vertex of segment
-        nx_m, ny_m = (1 - t) * n0 + t * n1   # linear blend
- 
-        # Re-normalise the blend (small magnitude change from linear interp)
-        blend_len = np.sqrt(nx_m**2 + ny_m**2)
-        if blend_len > 1e-9:
-            nx_m /= blend_len
-            ny_m /= blend_len
- 
-        # Apply y-offset in metres, convert back to degrees
-        lat = lat_c + (ny_m * y) / METRES_PER_DEG_LAT
-        lon = lon_c + (nx_m * y) / metres_per_deg_lon(lat_c)
- 
-        return float(lat), float(lon)
+        self.gps_lats = self._origin_lat + y_rot / METRES_PER_DEG_LAT
+        self.gps_lons = self._origin_lon + x_rot / metres_per_deg_lon(self._origin_lat)
+        
+        self._is_built = True
 
     def gps_to_local(self, lat: float, lon: float) -> tuple[float, float]:
-        """
-        GPS (lat, lon) → local river coords (x along stream, y across).
+        """Convert GPS back to unrotated simulation Cartesian coordinates (x, y)."""
+        if not self._is_built: raise RuntimeError("Tree not built.")
 
-        Finds the nearest point on the GPS polyline by projecting onto each
-        segment in metre-space, which gives the arc-length x and signed
-        cross-stream distance y.
-        """
-        if not self._is_set:
-            raise RuntimeError("Call set_gps_polyline() first.")
-
-        # Point in flat metres relative to origin
+        # 1. GPS to World Flat Space (relative to origin)
         mx = (lon - self._origin_lon) * metres_per_deg_lon(self._origin_lat)
         my = (lat - self._origin_lat) * METRES_PER_DEG_LAT
 
-        best_x, best_y, best_dist = 0.0, 0.0, np.inf
+        # 2. Un-rotate World Flat back to Simulation Space
+        c, s = np.cos(-self.heading), np.sin(-self.heading)
+        sim_x = mx * c - my * s
+        sim_y = mx * s + my * c
 
-        for i in range(len(self.gps_points) - 1):
-            lat0, lon0 = self.gps_points[i]
-            lat1, lon1 = self.gps_points[i + 1]
+        # We return pure x, y. The river_model already uses this exact space!
+        return float(sim_x), float(sim_y)
 
-            ax = (lon0 - self._origin_lon) * metres_per_deg_lon(self._origin_lat)
-            ay = (lat0 - self._origin_lat) * METRES_PER_DEG_LAT
-            bx = (lon1 - self._origin_lon) * metres_per_deg_lon(self._origin_lat)
-            by = (lat1 - self._origin_lat) * METRES_PER_DEG_LAT
+    def sim_cartesian_to_gps(self, buoy_x: float, buoy_y: float) -> tuple[float, float]:
+        """Translates a buoy's Cartesian coords directly to GPS."""
+        if not self._is_built: raise RuntimeError("Tree not built.")
 
-            seg_len_m = np.sqrt((bx - ax)**2 + (by - ay)**2)
-            if seg_len_m < 1e-9:
-                continue
+        # Apply Rigid Body Rotation and translate to the GPS origin
+        c, s = np.cos(self.heading), np.sin(self.heading)
+        x_rot = buoy_x * c - buoy_y * s
+        y_rot = buoy_x * s + buoy_y * c
 
-            t  = np.clip(((mx - ax)*(bx - ax) + (my - ay)*(by - ay)) / seg_len_m**2, 0, 1)
-            cx = ax + t * (bx - ax)
-            cy = ay + t * (by - ay)
+        lat = self._origin_lat + y_rot / METRES_PER_DEG_LAT
+        lon = self._origin_lon + x_rot / metres_per_deg_lon(self._origin_lat)
+        
+        return float(lat), float(lon)
 
-            dist = np.sqrt((mx - cx)**2 + (my - cy)**2)
-            if dist < best_dist:
-                best_dist = dist
-                best_x    = self._cum_s[i] + t * seg_len_m
-                # Signed y: cross product gives left/right sense
-                cross  = (bx - ax) * (my - ay) - (by - ay) * (mx - ax)
-                best_y = np.sign(cross) * dist
-
-        return float(best_x), float(best_y)
-
-    def river_centerline_as_gps(self, x_local_array: np.ndarray) -> list[tuple]:
-        """Convert centreline x positions to GPS [(lat, lon), ...]."""
-        return [self.local_to_gps(float(x), 0.0) for x in x_local_array]
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _build_arc_length(self):
-        pts = self.gps_points
-        s   = [0.0]
-        for i in range(1, len(pts)):
-            dlat = (pts[i][0] - pts[i-1][0]) * METRES_PER_DEG_LAT
-            dlon = (pts[i][1] - pts[i-1][1]) * metres_per_deg_lon(pts[i-1][0])
-            s.append(s[-1] + np.sqrt(dlat**2 + dlon**2))
-        self._cum_s   = np.array(s)
-        self._total_s = s[-1]
+    def river_centerline_as_gps(self):
+        coor = []
+        for i in range(len(self.gps_lats)):
+            coor.append((self.gps_lats[i] , self.gps_lons[i]))        
+        return coor

@@ -147,16 +147,10 @@ def layout():
                 config = {"displayModeBar": False},
             ),
 
-            # Bottom row: particles + backtrack
+            # Bottom row: backtrack #No particles anymore -> can be reimplemented easly
             html.Div(
                 style={"display": "flex", "flex": "1 1 40%", "gap": "8px"},
                 children=[
-                    dcc.Graph(
-                        id     = "river-plume-plot",
-                        figure = _empty_fig("Particle Plume"),
-                        style  = {"flex": "1"},
-                        config = {"displayModeBar": False},
-                    ),
                     dcc.Graph(
                         id     = "river-backtrack-plot",
                         figure = _empty_fig("Backtrack — Source Probability"),
@@ -213,7 +207,7 @@ def register_callbacks(app, sim_state):
             for t in _bank_traces(r):
                 fig.add_trace(t)
 
-            fig.update_layout(**_base_layout("Concentration & Flow Field — curvilinear"))
+            fig.update_layout(**_base_layout("Concentration & Flow Field — curvilinear"), uirevision="Don't change")
 
         else:
             # ---- Logical heatmap (fast, regular grid, indices as axes) ----
@@ -250,6 +244,7 @@ def register_callbacks(app, sim_state):
                            showgrid=True, gridcolor="#1e2a35"),
                 yaxis=dict(title="Width index",  color="#8b949e",
                            showgrid=True, gridcolor="#1e2a35"),
+                uirevision="Don't change"
             )
 
         # Buoy marker (always in physical coords for scatter mode; skip in logical)
@@ -272,61 +267,6 @@ def register_callbacks(app, sim_state):
 
         return fig
 
-    # ------------------------------------------------------------------
-
-    @app.callback(
-        Output("river-plume-plot", "figure"),
-        Input("live-update-interval", "n_intervals"),
-        Input("river-view-mode",      "value"),
-    )
-    def update_plume(_, view_mode):
-        if sim_state.river is None or sim_state.plume is None:
-            return _empty_fig("Particle Plume")
-
-        r = sim_state.river
-        p = sim_state.plume
-
-        fig = go.Figure()
-
-        if view_mode == "scatter":
-            for t in _bank_traces(r):
-                fig.add_trace(t)
-
-            fig.add_trace(go.Scattergl(
-                x=p.x, y=p.y,
-                mode="markers",
-                marker=dict(color="rgba(255,87,34,0.5)", size=4, symbol="circle"),
-                name="Particles",
-                hoverinfo="skip",
-            ))
-            fig.update_layout(**_base_layout("Lagrangian Particle Plume"))
-
-        else:
-            # Logical: bin particles into the grid cells
-            n_stream = r.vis_x.shape[0]
-            x_min, x_max = r.vis_x.min(), r.vis_x.max()
-            y_min, y_max = r.vis_y.min(), r.vis_y.max()
-            density, _, _ = np.histogram2d(
-                p.x, p.y, bins=[n_stream, r.n_width],
-                range=[[x_min, x_max], [y_min, y_max]],
-            )
-            fig.add_trace(go.Heatmap(
-                z=density.T, colorscale="Oranges",
-                colorbar=dict(title="Count", thickness=12, len=0.6,
-                              tickfont=dict(color="#8b949e", size=10)),
-            ))
-            fig.update_layout(
-                template="plotly_dark", paper_bgcolor="#0d1117",
-                plot_bgcolor="#111820", margin=dict(l=10, r=10, t=36, b=10),
-                title=dict(text="Particle density — logical grid",
-                           font=dict(color="#cdd9e5", size=12, family="monospace")),
-                xaxis=dict(title="Stream index", color="#8b949e",
-                           showgrid=True, gridcolor="#1e2a35"),
-                yaxis=dict(title="Width index", color="#8b949e",
-                           showgrid=True, gridcolor="#1e2a35"),
-            )
-
-        return fig
 
     # ------------------------------------------------------------------
 
@@ -352,7 +292,7 @@ def register_callbacks(app, sim_state):
             ))
             for t in _bank_traces(r):
                 fig.add_trace(t)
-            fig.update_layout(**_base_layout("Backtrack — Source Probability"))
+            fig.update_layout(**_base_layout("Backtrack — Source Probability"), uirevision="Don't change")
 
         else:
             fig.add_trace(go.Heatmap(

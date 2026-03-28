@@ -42,6 +42,12 @@ DEFAULT_SOURCE_COORDS  = [5, 0]
 DEFAULT_SOURCE_INTENSITY = 10
 DEFAULT_N_PARTICLES    = 200
 
+# --- Backtrack Simulation Defaults --- # should depend on cont level measured ig
+DEFAULT_DIFFUSIVITY_BACK    = 3
+DEFAULT_SOURCE_INTENSITY_BACK = 50
+
+
+
 # --- Contamination Detection ---
 CONTAMINATION_THRESHOLD = 1  
 
