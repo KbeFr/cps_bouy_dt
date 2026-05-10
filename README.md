@@ -105,6 +105,10 @@ Topics that are expected from thingsboard device :
 - ph 
 - ec 
 - do
+- IMU measurements : {ax , ay , az , gx , gy , gz, mx , my , mz}
+
+
+
 
 *can also be changed in code ofc
 

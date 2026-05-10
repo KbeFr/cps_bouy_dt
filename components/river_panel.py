@@ -139,13 +139,42 @@ def layout():
                 ]
             ),
 
-            # Concentration / flow field (main plot)
-            dcc.Graph(
-                id     = "river-concentration-plot",
-                figure = _empty_fig("Concentration & Flow Field"),
-                style  = {"flex": "1 1 60%"},
-                config = {"displayModeBar": False},
+            # Create a Div entity for flow field so graph can be split up. 
+            html.Div(
+                id="river-model-block" ,
+                style={"display": "flex", "flex": "1 1 40%", "gap": "8px"}, #check
+                children=[
+                            dcc.Graph(
+                            id     = "river-model-plot-0",
+                            figure = _empty_fig("River model with bouy location"),
+                            style  = {"flex": "1 1 60%"},
+                            config = {"displayModeBar": False},
+                                    )]
             ),
+
+
+            # View mode toggle for contamination type 
+            html.Div(
+                style={"display": "flex", "alignItems": "center", "gap": "12px",
+                       "padding": "0 4px"},
+                children=[
+                    html.Span("View:", style={"color": "#8b949e", "fontSize": "11px",
+                                               "fontFamily": "monospace"}),
+                    dcc.RadioItems(
+                        id="contamination-view-mode",
+                        options=[
+                            {"label": " Forward contamination flow", "value": "forward"},
+                            {"label": " Backtrack contamination",    "value": "backtrack"},
+                        ],
+                        value="scatter",
+                        style={"color": "#cdd9e5", "fontSize": "11px", "fontFamily": "monospace"},
+                        labelStyle={"display": "inline-block", "marginRight": "12px"},
+                        inputStyle={"marginRight": "4px"},
+                    ),
+                ]
+            ),
+
+
 
             # Bottom row: backtrack #No particles anymore -> can be reimplemented easly
             html.Div(
@@ -157,8 +186,9 @@ def layout():
                         style  = {"flex": "1"},
                         config = {"displayModeBar": False},
                     ),
+
                 ]
-            ),
+            )
         ]
     )
 
@@ -167,24 +197,37 @@ def layout():
 # Callbacks
 # ------------------------------------------------------------------
 
-def register_callbacks(app, sim_state):
+def get_graph_children(figures):
+    children = []
+    for i, figure in enumerate(figures):
+        children.append(dcc.Graph(
+                id     = f"river-model-plot-{i}",  
+                figure = figure,
+                style  = {"flex": "1"},            # 1 so they split the space evenly
+                config = {"displayModeBar": False},
+            ))
+    return children
+
+
+def register_callbacks(app, sim_state, buoy_dt_instance):
 
     @app.callback(
-        Output("river-concentration-plot", "figure"),
+        Output(component_id='river-model-block', component_property='children'),
         Input("live-update-interval",  "n_intervals"),
         Input("river-view-mode",        "value"),
     )
-    def update_concentration(_, view_mode):
+    def update_river_model(_, view_mode):
+
+        figures = []
+
         if sim_state.river is None:
-            return _empty_fig("Draw the river on the map to start")
+            return get_graph_children([(_empty_fig("Draw the river on the map to start"))])
 
-        r   = sim_state.river
-        con = sim_state.get_concentration_map()
-
-        fig = go.Figure()
+        r  = sim_state.river
 
         if view_mode == "scatter":
             # ---- Curvilinear scatter rendering (faithful to pcolormesh) ----
+            fig = go.Figure()
 
             # Velocity background
             fig.add_trace(_scatter_field(
@@ -192,65 +235,72 @@ def register_callbacks(app, sim_state):
                 colorscale="Blues", zmin=0, zmax=float(r.vis_v.max() or 1),
                 marker_size=4, name="Velocity (m/s)",
             ))
-            '''
-            # Concentration overlay (only where non-negligible)
-            if con is not None:
-                mask = con > 0.001
-                if mask.any():
-                    fig.add_trace(_scatter_field(
-                        r.vis_x, r.vis_y, np.where(mask, con, np.nan),
-                        colorscale="Oranges", zmin=0, zmax=0.5,
-                        marker_size=4, name="Concentration",
-                    ))
-            '''
+
             # Banks
             for t in _bank_traces(r):
                 fig.add_trace(t)
 
-            fig.update_layout(**_base_layout("Concentration & Flow Field — curvilinear"), uirevision="Don't change")
+            fig.update_layout(**_base_layout("Flow Field — curvilinear"), uirevision="Don't change")
+
+            figures.append(fig)
 
         else:
-            # ---- Logical heatmap (fast, regular grid, indices as axes) ----
+            # ---- Logical heatmap  ----
+            # Here the map needs to  be visualized as 2 straight sections with the velocities displayed
+            # So a left straigt section one with v and one with v_n 
+            
             n_stream, n_width = r.vis_v.shape
 
-            fig.add_trace(go.Heatmap(
-                z          = r.vis_v.T,
-                colorscale = "Blues",
-                showscale  = False,
-                name       = "Velocity",
+            #Stramwise velocity 
+            fig_v = go.Figure()
+
+            fig_v = go.Figure(data=go.Heatmap(
+                z=r.vis_v,
+                x=np.arange(r.vis_v.shape[0]),
+                y=np.arange(r.vis_v.shape[1]),
+                colorscale="Blues",
+                colorbar=dict(title="m/s", thickness=10),
+                hovertemplate="Stream: %{x}<br>Width: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
             ))
+            fig_v.update_layout(
+                **_base_layout("Streamwise Velocity (u)"),
+                xaxis_title="Cross-stream Index",
+                yaxis_title="Streamwise Index",
+                height=500 ,
+                width = 300,
+                uirevision="Don't change"
 
-            if con is not None:
-                fig.add_trace(go.Heatmap(
-                    z          = con.T,
-                    colorscale = "Oranges",
-                    zmin=0, zmax=0.5,
-                    opacity    = 0.8,
-                    colorbar   = dict(title="Conc.", thickness=12, len=0.6,
-                                      tickfont=dict(color="#8b949e", size=10)),
-                    name       = "Concentration",
-                ))
+            )
 
-            fig.update_layout(
-                template      = "plotly_dark",
-                paper_bgcolor = "#0d1117",
-                plot_bgcolor  = "#111820",
-                margin        = dict(l=10, r=10, t=36, b=10),
-                title         = dict(
-                    text="Concentration & Flow Field — logical grid",
-                    font=dict(color="#cdd9e5", size=12, family="monospace"),
-                ),
-                xaxis=dict(title="Stream index", color="#8b949e",
-                           showgrid=True, gridcolor="#1e2a35"),
-                yaxis=dict(title="Width index",  color="#8b949e",
-                           showgrid=True, gridcolor="#1e2a35"),
+            figures.append(fig_v)
+
+            #Normal direction velocity 
+            fig_vn = go.Figure()
+
+            fig_vn = go.Figure(data=go.Heatmap(
+                z=r.vis_vn,
+                x=np.arange(r.vis_vn.shape[0]),
+                y=np.arange(r.vis_vn.shape[1]),
+                colorscale="Blues",
+                colorbar=dict(title="m/s", thickness=10),
+                hovertemplate="Stream: %{x}<br>Width: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
+            ))
+            fig_vn.update_layout(
+                **_base_layout("Normal Velocity (u_n)"),
+                xaxis_title="Cross-stream Index",
+                yaxis_title="Streamwise Index",
+                height=500, 
+                width = 300,
                 uirevision="Don't change"
             )
+
+            figures.append(fig_vn)
+
 
         # Buoy marker (always in physical coords for scatter mode; skip in logical)
         if view_mode == "scatter":
             fig.add_trace(go.Scattergl(
-                x=[sim_state.buoy_local_x], y=[sim_state.buoy_local_y],
+                x=[buoy_dt_instance.local_x], y=[buoy_dt_instance.local_y],
                 mode="markers",
                 marker=dict(color="#ffeb3b", size=12, symbol="diamond",
                             line=dict(color="white", width=1.5)),
@@ -265,7 +315,7 @@ def register_callbacks(app, sim_state):
                     name="Detection point",
                 ))
 
-        return fig
+        return get_graph_children(figures)
 
 
     # ------------------------------------------------------------------
@@ -273,43 +323,32 @@ def register_callbacks(app, sim_state):
     @app.callback(
         Output("river-backtrack-plot", "figure"),
         Input("live-update-interval", "n_intervals"),
-        Input("river-view-mode",      "value"),
+        Input("contamination-view-mode",      "value"),
     )
     def update_backtrack(_, view_mode):
-        if sim_state.river is None or sim_state.backtrack_map is None:
-            return _empty_fig("No backtrack yet — awaiting detection")
+        r = sim_state.river
+        if r is None:
+            return _empty_fig("Draw the river on the map to start")
 
-        r  = sim_state.river
-        bt = sim_state.backtrack_map
+        if view_mode == "backtrack":
+            if sim_state.backtrack_map is None:
+                return _empty_fig("No backtrack yet — awaiting contamination detection")
+            data = sim_state.backtrack_map
+            title = "Backtrack — Source Probability"
+        else:
+            cmap = sim_state.get_concentration_map()
+            if cmap is None:
+                return _empty_fig("No contamination simulation yet")
+            data = cmap
+            title = "DVSolver — Forward Contamination"
 
         fig = go.Figure()
-
-        if view_mode == "scatter":
-            fig.add_trace(_scatter_field(
-                r.vis_x, r.vis_y, bt,
-                colorscale="Reds", zmin=0, zmax=float(bt.max() or 1),
-                marker_size=4, name="Source probability",
-            ))
-            for t in _bank_traces(r):
-                fig.add_trace(t)
-            fig.update_layout(**_base_layout("Backtrack — Source Probability"), uirevision="Don't change")
-
-        else:
-            fig.add_trace(go.Heatmap(
-                z=bt.T, colorscale="Reds",
-                zmin=0, zmax=float(bt.max() or 1),
-                colorbar=dict(title="Prob.", thickness=12, len=0.6,
-                              tickfont=dict(color="#8b949e", size=10)),
-            ))
-            fig.update_layout(
-                template="plotly_dark", paper_bgcolor="#0d1117",
-                plot_bgcolor="#111820", margin=dict(l=10, r=10, t=36, b=10),
-                title=dict(text="Backtrack — logical grid",
-                           font=dict(color="#cdd9e5", size=12, family="monospace")),
-                xaxis=dict(title="Stream index", color="#8b949e",
-                           showgrid=True, gridcolor="#1e2a35"),
-                yaxis=dict(title="Width index", color="#8b949e",
-                           showgrid=True, gridcolor="#1e2a35"),
-            )
-
+        fig.add_trace(_scatter_field(
+            r.vis_x, r.vis_y, data,
+            colorscale="Reds", zmin=0, zmax=float(data.max() or 1),
+            marker_size=4, name="Concentration",
+        ))
+        for t in _bank_traces(r):
+            fig.add_trace(t)
+        fig.update_layout(**_base_layout(title), uirevision="Don't change")
         return fig

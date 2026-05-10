@@ -2,28 +2,6 @@
 # app.py — Buoy Digital Twin — Main Dash Application
 # =============================================================================
 #
-# Architecture:
-#
-#   app.py                     ← you are here (entry point + layout + main interval)
-#   config.py                  ← all constants & credentials
-#   core/
-#     georef.py                ← GPS ↔ local coordinate transforms
-#     buoy_dt.py               ← ThingsBoard HTTP client + polling
-#     simulation.py            ← physics state machine (River + particles + DV)
-#     river_model.py           ← YOUR existing River / LagrangianParticles / DVsolver
-#   components/
-#     control_panel.py         ← left sidebar: readouts, mode selector, buttons
-#     map_panel.py             ← centre: satellite map (dash-leaflet)
-#     river_panel.py           ← right: plotly river model visualisation
-#
-# Install deps:
-#   pip install dash dash-leaflet dash-bootstrap-components plotly
-#               numpy scipy requests
-#   pip install discretize  (for DVsolver)
-#
-# Run:
-#   python app.py
-# =============================================================================
 
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
@@ -33,16 +11,12 @@ from dash import html, dcc, Input, Output
 
 # --- Core singletons (created once, shared across callbacks) ---
 from core.simulation import SimulationState
-from core.buoy_comm    import BuoyComm
+from core.global_buoy_dt import BuoyDigitalTwin , BuoyMode
 
-sim_state = SimulationState()
-buoy_dt   = BuoyComm()
 
-# Attempt ThingsBoard login on startup (non-fatal if offline)
-buoy_dt.login()
+buoy_dt = BuoyDigitalTwin()
+sim_state = SimulationState(buoy_dt)
 
-# Wire ThingsBoard polling → simulation sensor cache
-buoy_dt.start_polling(callback=sim_state.update_sensor)
 
 # --- Import panels (after singletons so callbacks can close over them) ---
 from components import control_panel, map_panel, river_panel
@@ -98,7 +72,7 @@ app.layout = html.Div(
                                                             "fontSize": "10px",
                                                             "letterSpacing": "0.15em"}),
                         html.Span(
-                            "← Draw river centerline using the toolbar",
+                            "",
                             style={"color": "#3d5166", "fontSize": "10px",
                                    "marginLeft": "auto"},
                         ),
@@ -169,9 +143,12 @@ app.layout = html.Div(
     Input("sim-step-interval", "n_intervals"),
 )
 def tick_simulation(_):
-    """Advance the physics on every sim-step-interval tick."""
-    sim_state.step()
-    mode = "SIM" if sim_state.mode == SimulationState.MODE_SIMULATED else "REAL"
+    try:
+        sim_state.step()
+    except Exception as e:
+        print(f"[tick] step error: {e}")
+        import traceback; traceback.print_exc()
+    mode = "SIM" if sim_state.mode == BuoyMode.SIM else "REAL"
     return f"t={sim_state.sim_time}  |  mode={mode}  |  {'▶ RUNNING' if sim_state.running else '⏸ PAUSED'}"
 
 
@@ -180,8 +157,8 @@ def tick_simulation(_):
 # =============================================================================
 
 control_panel.register_callbacks(app, sim_state, buoy_dt)
-map_panel.register_callbacks(app, sim_state)
-river_panel.register_callbacks(app, sim_state)
+map_panel.register_callbacks(app, sim_state,buoy_dt)
+river_panel.register_callbacks(app, sim_state, buoy_dt)
 
 
 # =============================================================================

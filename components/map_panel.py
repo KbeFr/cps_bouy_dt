@@ -35,6 +35,16 @@ ESRI_LABELS = dl.TileLayer(
 _STEP_COLORS = {0: "#ff9800", 1: "#00e5ff", 2: "#69f0ae", 3: "#69f0ae"}
 
 
+
+redIcon = dict(
+    iconUrl= 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+    shadowUrl= 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+    iconSize= [25, 41],
+    iconAnchor= [12, 41],
+    popupAnchor= [1, -34],
+    shadowSize= [41, 41],
+    )
+
 def layout():
     return html.Div(
         id="map-panel",
@@ -97,8 +107,17 @@ def layout():
                         ],
                     ),
 
-                    # Placeholder for contamination source marker (added dynamically)
-                    html.Div(id="contamination-marker-container"),
+                    # Contamination marker — position updated every interval
+                    dl.Marker(
+                        id="contamination-marker",
+                        position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
+                        icon=redIcon,
+                        children=[
+                            dl.Tooltip("Contamination"),
+                            dl.Popup(id="cont-popup", children="Contamination position"),
+                        ],
+                    ),
+
                 ],
             ),
 
@@ -165,7 +184,7 @@ def layout():
     )
 
 
-def register_callbacks(app, sim_state):
+def register_callbacks(app, sim_state , buoy_dt_instance ):
 
     # ------------------------------------------------------------------
     # Main drawing callback — dispatches to the correct setup step
@@ -238,30 +257,36 @@ def register_callbacks(app, sim_state):
         Output("buoy-marker",        "position"),
         Output("buoy-track",         "positions"),
         Output("buoy-popup",         "children"),
+        Output("contamination-marker" ,  "position"), 
         Output("contam-alert-badge", "style"),
         Input("live-update-interval", "n_intervals"),
     )
     def update_buoy_on_map(_):
-        pos   = [sim_state.buoy_gps_lat, sim_state.buoy_gps_lon]
-        track = list(sim_state.buoy_history_gps)
+        lat = buoy_dt_instance.lat or config.MAP_DEFAULT_LAT
+        lon = buoy_dt_instance.lon or config.MAP_DEFAULT_LON
+        pos = [lat, lon]
+
+        track = list(buoy_dt_instance.buoy_history_gps)   # moved to buoy_dt
 
         popup_text = (
-            f"Lat: {sim_state.buoy_gps_lat:.6f}\n"
-            f"Lon: {sim_state.buoy_gps_lon:.6f}\n"
-            f"Stream x: {sim_state.buoy_local_x:.1f} m\n"
+            f"Lat: {lat:.6f}\n"
+            f"Lon: {lon:.6f}\n"
+            f"Stream x: {buoy_dt_instance.local_x:.1f} m\n" if buoy_dt_instance.local_x else
+            f"Stream x: --\n"
             f"Step: {sim_state.sim_time}"
         )
 
         badge_style = {
-            "position":      "absolute",
-            "top":           "12px",
-            "left":          "50%",
-            "transform":     "translateX(-50%)",
-            "zIndex":        1000,
-            "display":       "block" if sim_state.contamination_detected else "none",
+            "position": "absolute", "top": "12px", "left": "50%",
+            "transform": "translateX(-50%)", "zIndex": 1000,
+            "display": "block" if sim_state.contamination_detected else "none",
             "pointerEvents": "none",
         }
-        return pos, track, popup_text, badge_style
+
+        cont_gps = sim_state.contamination_gps
+        pos_cont = list(cont_gps) if cont_gps else [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
+
+        return pos, track, popup_text, pos_cont, badge_style
 
     # ------------------------------------------------------------------
     # Workflow hint on initial load

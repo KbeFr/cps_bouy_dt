@@ -7,6 +7,8 @@ import time
 import threading
 from typing import Callable
 import config
+from dataclasses import dataclass
+
 
 
 class BuoyComm:
@@ -97,7 +99,7 @@ class BuoyComm:
                             flat[k] = float(v_list[0]["value"])
                         except (ValueError, TypeError):
                             flat[k] = v_list[0]["value"]
-                self.latest     = flat
+                self.latest = flat
                 self.last_update = time.time()
                 return flat
             else:
@@ -159,6 +161,13 @@ class BuoyComm:
     # ------------------------------------------------------------------
     # RPC — send commands (motor control, future use)
     # ------------------------------------------------------------------
+
+    # Send rpc asynchronous do it doesn't interrupt the program flow
+    def send_rpc_async(self, method: str, params: dict):
+        def _task():
+            self.send_rpc(method, params)
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def send_rpc(self, method: str, params: dict, timeout_ms: int = 5000) -> dict | None:
         """

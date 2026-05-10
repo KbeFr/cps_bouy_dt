@@ -30,21 +30,25 @@ DEFAULT_MIN_ANGLE = 0 #at what angle is the drawn line intersection considered a
 
 DEFAULT_WIDTH          = 80      # metres
 DEFAULT_DS_L           = 5     # grid spacing along stream
-DEFAULT_N_WIDTH        = 25      # grid points across width
+DEFAULT_N_WIDTH        = 50      # grid points across width
 DEFAULT_U_AVG          = 1.5     # m/s base velocity
 DEFAULT_ALPHA_SEC      = 10      # secondary flow factor
 
 # --- Pollution Simulation Defaults ---
 DEFAULT_D_L            = 5.0     # longitudinal diffusion
 DEFAULT_D_T            = 1.0     # transverse diffusion
-DEFAULT_DIFFUSIVITY    = 0.5
+DEFAULT_DIFFUSIVITY    = 10
 DEFAULT_SOURCE_COORDS  = [5, 0]
-DEFAULT_SOURCE_INTENSITY = 10
+DEFAULT_SOURCE_INTENSITY = 50
 DEFAULT_N_PARTICLES    = 200
 
 # --- Backtrack Simulation Defaults --- # should depend on cont level measured ig
-DEFAULT_DIFFUSIVITY_BACK    = 3
-DEFAULT_SOURCE_INTENSITY_BACK = 50
+DEFAULT_DIFFUSIVITY_BACK    = 20
+DEFAULT_SOURCE_INTENSITY_BACK = 100
+
+# --------- Buoy DT simulation ---------
+DEFAULT_D_T_BUOY            = 0.07     # transverse diffusion
+
 
 
 

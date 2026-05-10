@@ -8,14 +8,6 @@ from scipy.spatial import cKDTree
 
 METRES_PER_DEG_LAT = 111_320.0
 
-def metres_per_deg_lon(lat_deg: float) -> float:
-    return METRES_PER_DEG_LAT * np.cos(np.radians(lat_deg))
-
-def _flush_group(group_s, group_angles, fallback_radius):
-    s_centre      = (group_s[0] + group_s[-1]) / 2.0
-    total_angle   = sum(group_angles)
-    window_length = max(1.0, group_s[-1] - group_s[0])
-    return (s_centre, total_angle, window_length)
 
 
 class GeoReference:
@@ -99,20 +91,20 @@ class GeoReference:
         return topology
 
     # ------------------------------------------------------------------
-    # The New Discretized Tree Engine
+    # New Discretized Tree Engine
     # ------------------------------------------------------------------
 
     def build_discretized_tree(self, topology: list, ds_length: float):
         self.ds_length = ds_length
         
-        # 1. Calculate Initial Real-World Heading from GPS
+        # Calculate Initial Real-World Heading from GPS
         lat0, lon0 = self.gps_points[0]
         lat1, lon1 = self.gps_points[1]
         dx = (lon1 - lon0) * metres_per_deg_lon(lat0)
         dy = (lat1 - lat0) * METRES_PER_DEG_LAT
         self.heading = np.arctan2(dy, dx)
 
-        # 2. Build Unrotated Centerline (Matches Simulation Exactly)
+        # Build Unrotated Centerline (Matches Simulation Exactly)
         x_cl, y_cl = [0.0], [0.0]
         theta = 0.0  
         
@@ -134,7 +126,7 @@ class GeoReference:
         self.xc = np.array(x_cl)
         self.yc = np.array(y_cl)
 
-        # 3. Compute normal vectors in Unrotated Space
+        # Compute normal vectors in Unrotated Space
         dx_arr = np.gradient(self.xc)
         dy_arr = np.gradient(self.yc)
         lengths = np.sqrt(dx_arr**2 + dy_arr**2)
@@ -142,10 +134,10 @@ class GeoReference:
         self.nx_m = -dy_arr / lengths
         self.ny_m = dx_arr / lengths
 
-        # 4. Build KDTree in UNROTATED Simulation Space
+        # Build KDTree in UNROTATED Simulation Space
         self.sim_tree = cKDTree(np.column_stack((self.xc, self.yc)))
 
-        # 5. Pre-calculate GPS coords (Apply Rotation to World Space)
+        #  Pre-calculate GPS coords (Apply Rotation to World Space)
         c, s = np.cos(self.heading), np.sin(self.heading)
         x_rot = self.xc * c - self.yc * s
         y_rot = self.xc * s + self.yc * c
@@ -159,11 +151,11 @@ class GeoReference:
         """Convert GPS back to unrotated simulation Cartesian coordinates (x, y)."""
         if not self._is_built: raise RuntimeError("Tree not built.")
 
-        # 1. GPS to World Flat Space (relative to origin)
+        # GPS to World Flat Space (relative to origin)
         mx = (lon - self._origin_lon) * metres_per_deg_lon(self._origin_lat)
         my = (lat - self._origin_lat) * METRES_PER_DEG_LAT
 
-        # 2. Un-rotate World Flat back to Simulation Space
+        # Un-rotate World Flat back to Simulation Space
         c, s = np.cos(-self.heading), np.sin(-self.heading)
         sim_x = mx * c - my * s
         sim_y = mx * s + my * c
@@ -185,8 +177,46 @@ class GeoReference:
         
         return float(lat), float(lon)
 
+
+    def gps_heading_to_sim(self, mag_heading_world_rad) -> float:
+        """
+        mag_heading_world_rad : arctan2(my, mx) from magnetometer — math convention.
+        """
+        return float(_wrap_angle(mag_heading_world_rad - self.heading))
+
+
+    def gps_components_to_sim(self,  north_component : float  ,east_component : float  )-> tuple[float, float]:
+        """
+        Converts GPS based coorindate system components to local sim system
+        """
+        #Note :  lon (measure for "southness") -> x_local 
+        #     :  lat (measure for "northness") -> y_local 
+        x_local_comp = east_component * np.cos(self.heading) + north_component * np.sin(self.heading)
+        y_local_comp = - east_component * np.sin(self.heading) + north_component * np.cos(self.heading)
+        return float(x_local_comp) ,  float(y_local_comp)
+
+
+
     def river_centerline_as_gps(self):
         coor = []
         for i in range(len(self.gps_lats)):
             coor.append((self.gps_lats[i] , self.gps_lons[i]))        
         return coor
+
+    @property
+    def is_set(self):
+        return self._is_set
+
+
+def _wrap_angle(a: float) -> float:
+    """Wrap angle to [-π, π]."""
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+def metres_per_deg_lon(lat_deg: float) -> float:
+    return METRES_PER_DEG_LAT * np.cos(np.radians(lat_deg))
+
+def _flush_group(group_s, group_angles, fallback_radius):
+    s_centre      = (group_s[0] + group_s[-1]) / 2.0
+    total_angle   = sum(group_angles)
+    window_length = max(1.0, group_s[-1] - group_s[0])
+    return (s_centre, total_angle, window_length)
