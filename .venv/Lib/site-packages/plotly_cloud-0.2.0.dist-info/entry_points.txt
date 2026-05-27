@@ -1,0 +1,5 @@
+[console_scripts]
+plotly = plotly_cloud.cli:main
+
+[dash_hooks]
+plotly_cloud_devtools = plotly_cloud._devtool_hooks

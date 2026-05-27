@@ -5,6 +5,7 @@
 import requests
 import time
 import threading
+import json
 from typing import Callable
 import config
 from dataclasses import dataclass
@@ -91,14 +92,23 @@ class BuoyComm:
             )
             if resp.status_code == 200:
                 raw = resp.json()
-                # Flatten: {"temperature": [{"ts":..., "value":"29.6"}]} -> {"temperature": 29.6}
+                # Flatten and decode nested JSON strings from ThingsBoard.
                 flat = {}
                 for k, v_list in raw.items():
                     if v_list:
+                        raw_value = v_list[0]["value"]
                         try:
-                            flat[k] = float(v_list[0]["value"])
+                            flat[k] = float(raw_value)
                         except (ValueError, TypeError):
-                            flat[k] = v_list[0]["value"]
+                            if isinstance(raw_value, str):
+                                stripped = raw_value.strip()
+                                if stripped.startswith(("{", "[")):
+                                    try:
+                                        flat[k] = json.loads(stripped)
+                                        continue
+                                    except json.JSONDecodeError:
+                                        pass
+                            flat[k] = raw_value
                 self.latest = flat
                 self.last_update = time.time()
                 return flat

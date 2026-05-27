@@ -209,31 +209,37 @@ class River:
 
 class DVsolver:
     """
-    Steady-state advection-diffusion solver for contamination plume display.
+    2-D advection-dispersion solver for river contaminant plume.
 
-        ∇·(u c) - ∇·(D ∇c) = q
+        ∂C/∂t + ∇·(u C) = ∇·(D ∇C) + q
 
-    Solves directly for the time-independent concentration field — no
-    time-stepping needed.  This gives a permanent plume shape that stays
-    anchored to the source and never drifts away.
+    where D is the *anisotropic* dispersion tensor diag(D_L, D_T).
+
+    In rivers the longitudinal and transverse dispersion coefficients
+    differ by orders of magnitude (Fischer 1979):
+
+        D_L = 0.011 · U²·W² / (H · u*)         ~10²–10³ m²/s
+        D_T = β · H · u*                       ~10⁻¹ m²/s   (β ≈ 0.6–1)
+
+    A scalar (isotropic) D produces a small symmetric blob; the
+    anisotropic form produces the long thin downstream streak you see
+    in real dye-tracer experiments.
 
     Boundary conditions
     -------------------
-    Upstream (x=0)  : Neumann (no-flux) — contamination cannot re-enter
-    Downstream (x=L): Dirichlet c=0    — concentration exits freely
-    Banks (y=±W/2)  : Neumann (no-flux) — impermeable banks
-
-    With a zero-concentration outlet, the steady-state solution exists and
-    is unique.  The plume extends downstream from the source and decays to
-    zero at the outlet — exactly what you want to visualise.
+    Upstream (s=0)  : Neumann (no-flux)
+    Downstream (s=L): Dirichlet c=0
+    Banks (n=±W/2)  : Neumann (no-flux)
 
     Parameters
     ----------
     river : River
     source_coords : [x, y]      Local coords of the pollution source.
-    source_intensity : float    Source strength (concentration·m²/s).
-    diffusion : float            Isotropic diffusion coefficient D (m²/s).
-    step : float                 Unused — kept for API compatibility.
+    source_intensity : float    Source strength.
+    D_L : float                 Longitudinal dispersion (m²/s).
+    D_T : float                 Transverse  dispersion (m²/s).
+    step : float                Implicit time-step (s) for the linear solve.
+    is_adjoint : bool           Reverse the velocity field (backward run).
     """
 
     def __init__(
@@ -241,9 +247,10 @@ class DVsolver:
         river: River,
         source_coords: list,
         source_intensity: float,
-        diffusion: float,
+        D_L: float,
+        D_T: float,
         step: float,
-        is_adjoint : bool           
+        is_adjoint : bool,
     ):
         self.river = river
 
@@ -305,10 +312,15 @@ class DVsolver:
         # Steady-state operator  M·p = s
         # "neumann" = free (natural), "dirichlet" = zero value.
         # ------------------------------------------------------------------
-        
-        # Define diffusivity within each cell
-        a = mkvc(diffusion * np.ones(self.mesh.nC))
 
+        # Diagonal anisotropic dispersion tensor: D_L on streamwise (mesh-x)
+        # faces, D_T on cross-stream (mesh-y) faces.  Discretize accepts a
+        # length-2*nC vector as diag(d_x, d_y) — see TensorMesh docs.
+        nC = self.mesh.nC
+        a  = mkvc(np.concatenate([
+            D_L * np.ones(nC),   # streamwise diffusion (large)
+            D_T * np.ones(nC),   # cross-stream diffusion (small)
+        ]))
 
         # Define the matrix M
         Afc = self.mesh.dim * self.mesh.aveF2CC  # modified averaging operator to sum dot product
@@ -333,7 +345,8 @@ class DVsolver:
         B = I + step * M
         self.s = Mc_inv * q
 
-        self.Binv = splu(B)
+        # splu requires CSC; convert explicitly to silence SparseEfficiencyWarning.
+        self.Binv = splu(B.tocsc())
 
 
     def update(self) -> np.ndarray:

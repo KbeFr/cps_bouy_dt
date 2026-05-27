@@ -1,0 +1,9 @@
+Metadata-Version: 2.1
+Name: dash-leaflet
+Version: 1.0.0
+Summary: Dash Leaflet is a light wrapper around React-Leaflet. The syntax is similar to other Dash components, with naming conventions following the React-Leaflet API.
+Author: Emil Haldrup Eriksen <emil.h.eriksen@gmail.com>
+License: MIT
+Classifier: Framework :: Dash
+License-File: LICENSE
+

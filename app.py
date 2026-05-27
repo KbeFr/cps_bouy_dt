@@ -149,7 +149,7 @@ def tick_simulation(_):
         print(f"[tick] step error: {e}")
         import traceback; traceback.print_exc()
     mode = "SIM" if sim_state.mode == BuoyMode.SIM else "REAL"
-    return f"t={sim_state.sim_time}  |  mode={mode}  |  {'▶ RUNNING' if sim_state.running else '⏸ PAUSED'}"
+    return f"t={sim_state.sim_time:.0f}s  |  mode={mode}  |  {'▶ RUNNING' if sim_state.running else '⏸ PAUSED'}"
 
 
 # =============================================================================

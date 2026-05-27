@@ -1,27 +1,29 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
+import time
+import json
 
 
 @dataclass
 class GPSData:
     lat: float
     lon: float
-    vn: float
-    vs: float
+    vn: float        # speed north (m/s)
+    vs: float        # speed east  (m/s)  — firmware field is `speed_s`
 
 
 @dataclass
 class IMUData:
-    dt: float
-    ax: float
-    ay: float
-    az: float
-    gx: float
-    gy: float
-    gz: float
-    mx: float
-    my: float
-    mz: float
+    dt: float        # seconds since previous sample (derived, since firmware does not send it)
+    ax: float = 0.0
+    ay: float = 0.0
+    az: float = 0.0
+    gx: float = 0.0
+    gy: float = 0.0
+    gz: float = 0.0
+    mx: float = 0.0
+    my: float = 0.0
+    mz: float = 0.0
 
 
 @dataclass
@@ -31,7 +33,9 @@ class BuoySensorData:
     ec: Optional[float] = None
     do: Optional[float] = None
     gps: Optional[GPSData] = None
-    imu: Optional[List[IMUData]] = None
+    imu: Optional[List[IMUData]] = field(default_factory=list)
+    counter: Optional[int] = None
+    last_imu_ts: float = 0.0
 
     # --- Formatting Properties for the UI ---
 
@@ -60,66 +64,118 @@ class BuoySensorData:
         return f"{self.do:.2f}" if self.do is not None else "--"
 
 
+def _to_float(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_dict(v) -> Optional[dict]:
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 class BuoySensor:
+    """
+    Parses the flat telemetry dict produced by BuoyComm.get_latest() into a
+    typed BuoySensorData snapshot.
+
+    The Walter firmware publishes telemetry across several MQTT messages:
+      Pub 1   : {temp, ph, ec, do, counter, gps:{lat,lon,speed_n,speed_s}, timestamp}
+      Pub 1b  : flat {lat, lon, speed_n, speed_s}
+      Pub 2   : {imu:{ax, ay, gz, mx, my, timestamp}}
+      Pub 2b  : flat {ax, ay, gz, mx, my}
+
+    ThingsBoard exposes each key with its most-recent value via values/timeseries,
+    so we read whichever form is present (flat preferred, nested as fallback).
+    """
+
     def __init__(self):
-        # --- Buoy sensor data state ---
         self.data: BuoySensorData = BuoySensorData()
 
     def update_sensor(self, data: dict):
-        """
-        Parses incoming raw dictionary data from ThingsBoard polling
-        and safely updates the internal dataclass.
-        """
+        if not data:
+            return
 
-        # --- Temperature ---
-        if "temp" in data:
-            self.data.temperature = data.get("temp")
+        # --- Water quality ---
+        temp = _to_float(data.get("temp"))
+        if temp is not None:
+            self.data.temperature = temp
 
-        # --- Water Quality Sensors ---
-        if "ph" in data:
-            self.data.ph = data.get("ph")
+        ph = _to_float(data.get("ph"))
+        if ph is not None:
+            self.data.ph = ph
 
-        if "ec" in data:
-            self.data.ec = data.get("ec")
+        ec = _to_float(data.get("ec"))
+        if ec is not None:
+            self.data.ec = ec
 
-        if "do" in data:
-            self.data.do = data.get("do")
+        do = _to_float(data.get("do"))
+        if do is not None:
+            self.data.do = do
+
+        counter = _to_float(data.get("counter"))
+        if counter is not None:
+            self.data.counter = int(counter)
 
         # --- GPS ---
-        if "gps" in data and isinstance(data["gps"], dict):
-            gps_data = data.get("gps", {})
+        # Prefer flat fields (latest single-value snapshot); fall back to nested dict.
+        lat = _to_float(data.get("lat"))
+        lon = _to_float(data.get("lon"))
+        sn  = _to_float(data.get("speed_n"))
+        ss  = _to_float(data.get("speed_s"))
+
+        gps_dict = _to_dict(data.get("gps"))
+        if (lat is None or lon is None) and gps_dict is not None:
+            g = gps_dict
+            lat = _to_float(g.get("lat")) if lat is None else lat
+            lon = _to_float(g.get("lon")) if lon is None else lon
+            sn  = _to_float(g.get("speed_n")) if sn is None else sn
+            ss  = _to_float(g.get("speed_s")) if ss is None else ss
+
+        if lat is not None and lon is not None:
             self.data.gps = GPSData(
-                lat=gps_data.get("latitude", 0.0),
-                lon=gps_data.get("longitude", 0.0),
-                vn=gps_data.get("speed_north", 0.0),
-                vs=gps_data.get("speed_east", 0.0)
+                lat=lat, lon=lon,
+                vn=sn if sn is not None else 0.0,
+                vs=ss if ss is not None else 0.0,
             )
 
-        # --- IMU Batch ---
-        if "imu" in data and isinstance(data["imu"], list):
-            imu_batch_raw = data.get("imu", [])
-            parsed_imu_batch = []
+        # --- IMU (firmware sends one sample per cycle, flat-keyed) ---
+        ax = _to_float(data.get("ax"))
+        ay = _to_float(data.get("ay"))
+        gz = _to_float(data.get("gz"))
+        mx = _to_float(data.get("mx"))
+        my = _to_float(data.get("my"))
 
-            for imu_raw in imu_batch_raw:
-                # Catch instances where an individual reading might be malformed
-                if not isinstance(imu_raw, dict):
-                    continue
+        # Nested fallback
+        imu_dict = _to_dict(data.get("imu"))
+        if all(v is None for v in (ax, ay, gz, mx, my)) and imu_dict is not None:
+            imu_d = imu_dict
+            ax = _to_float(imu_d.get("ax"))
+            ay = _to_float(imu_d.get("ay"))
+            gz = _to_float(imu_d.get("gz"))
+            mx = _to_float(imu_d.get("mx"))
+            my = _to_float(imu_d.get("my"))
 
-                parsed_imu_batch.append(
-                    IMUData(
-                        dt=imu_raw.get("dt", 0.0),
-                        ax=imu_raw.get("ax", 0.0),
-                        ay=imu_raw.get("ay", 0.0),
-                        az=imu_raw.get("az", 0.0),
-                        gx=imu_raw.get("gx", 0.0),
-                        gy=imu_raw.get("gy", 0.0),
-                        gz=imu_raw.get("gz", 0.0),
-                        mx=imu_raw.get("mx", 0.0),
-                        my=imu_raw.get("my", 0.0),
-                        mz=imu_raw.get("mz", 0.0)
-                    )
-                )
-
-            # Only overwrite the existing IMU data if the new batch actually contains data
-            if parsed_imu_batch:
-                self.data.imu = parsed_imu_batch
+        if any(v is not None for v in (ax, ay, gz, mx, my)):
+            now = time.time()
+            dt  = (now - self.data.last_imu_ts) if self.data.last_imu_ts > 0 else 0.0
+            self.data.last_imu_ts = now
+            sample = IMUData(
+                dt=dt,
+                ax=ax or 0.0, ay=ay or 0.0,
+                gz=gz or 0.0,
+                mx=mx or 0.0, my=my or 0.0,
+            )
+            # Append as a 1-element batch so downstream EKF code can iterate
+            self.data.imu = [sample]

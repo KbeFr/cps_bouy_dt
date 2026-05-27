@@ -1,22 +1,12 @@
 # =============================================================================
-# components/map_panel.py — Satellite map panel (dash-leaflet)
+# components/map_panel.py — Satellite map with persistent river drawing
 # =============================================================================
 #
-# Three-step setup workflow driven by sim_state.setup_step:
-#
-#   Step 0  User draws a 2-point POLYLINE across the river → measures width
-#   Step 1  User draws a multi-point POLYLINE along the centreline → builds model
-#   Step 2  User places a MARKER → sets buoy start position
-#   Step 3  Ready — simulation can be started
-#
-# After setup, the map shows:
-#   - River centreline model overlay (dashed cyan)
-#   - Buoy GPS track (yellow trail)
-#   - Live buoy marker (yellow diamond icon)
-#   - Contamination alert badge
+# The latest drawn river centerline is saved and reused after restarting.
+# The map also places the CONTAMINATION SOURCE and BUOY START markers.
 
 import dash_leaflet as dl
-from dash import html, Input, Output
+from dash import html, dcc, Input, Output, State, no_update
 import config
 
 
@@ -31,19 +21,21 @@ ESRI_LABELS = dl.TileLayer(
     opacity=0.7,
 )
 
-# Colour coding per step
-_STEP_COLORS = {0: "#ff9800", 1: "#00e5ff", 2: "#69f0ae", 3: "#69f0ae"}
 
-
-
-redIcon = dict(
-    iconUrl= 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
-    shadowUrl= 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
-    iconSize= [25, 41],
-    iconAnchor= [12, 41],
-    popupAnchor= [1, -34],
-    shadowSize= [41, 41],
+def _icon(color: str):
+    return dict(
+        iconUrl=f"https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-{color}.png",
+        shadowUrl="https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png",
+        iconSize=[25, 41], iconAnchor=[12, 41],
+        popupAnchor=[1, -34], shadowSize=[41, 41],
     )
+
+
+redIcon    = _icon("red")
+greenIcon  = _icon("green")
+yellowIcon = _icon("yellow")
+blueIcon   = _icon("blue")
+
 
 def layout():
     return html.Div(
@@ -59,123 +51,121 @@ def layout():
                     ESRI_SATELLITE,
                     ESRI_LABELS,
 
-                    # Draw toolbar
+                    # Polyline-drawing tool for replacing the saved river.
                     dl.FeatureGroup(
                         id="draw-feature-group",
                         children=[
                             dl.EditControl(
                                 id="draw-control",
                                 draw={
-                                    "polyline":    True,
-                                    "marker":      True,
-                                    "polygon":     False,
-                                    "circle":      False,
-                                    "circlemarker":False,
-                                    "rectangle":   False,
+                                    "polyline":     True,
+                                    "marker":       False,
+                                    "polygon":      False,
+                                    "circle":       False,
+                                    "circlemarker": False,
+                                    "rectangle":    False,
                                 },
                                 edit={"edit": False, "remove": True},
                             )
                         ]
                     ),
 
-                    # River model centreline overlay (dashed)
+                    # River centerline (preloaded — drawn on app start)
                     dl.Polyline(
                         id="river-centerline-overlay",
                         positions=[],
-                        color="#00e5ff",
-                        weight=2,
-                        opacity=0.75,
-                        dashArray="6 4",
+                        color="#00e5ff", weight=3, opacity=0.85, dashArray="6 4",
                     ),
 
                     # Buoy GPS track
                     dl.Polyline(
                         id="buoy-track",
                         positions=[],
-                        color="#ffeb3b",
-                        weight=2,
-                        opacity=0.7,
+                        color="#ffeb3b", weight=2, opacity=0.7,
                     ),
 
-                    # Live buoy marker — position updated every interval
+                    # Live buoy marker
                     dl.Marker(
                         id="buoy-marker",
                         position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
-                        children=[
-                            dl.Tooltip("Buoy"),
-                            dl.Popup(id="buoy-popup", children="Buoy position"),
-                        ],
+                        icon=yellowIcon,
+                        children=[dl.Tooltip("Buoy")],
                     ),
 
-                    # Contamination marker — position updated every interval
+                    # Buoy START marker (reference)
                     dl.Marker(
-                        id="contamination-marker",
+                        id="buoy-start-marker",
+                        position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
+                        icon=greenIcon,
+                        children=[dl.Tooltip("Buoy start")],
+                    ),
+
+                    # Contamination SOURCE marker (true source, sim only)
+                    dl.Marker(
+                        id="source-marker",
                         position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
                         icon=redIcon,
-                        children=[
-                            dl.Tooltip("Contamination"),
-                            dl.Popup(id="cont-popup", children="Contamination position"),
-                        ],
+                        children=[dl.Tooltip("Source")],
                     ),
 
+                    # Estimated source marker (from backtracking)
+                    dl.Marker(
+                        id="estimated-source-marker",
+                        position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
+                        icon=blueIcon,
+                        children=[dl.Tooltip("Estimated source (backtrack)")],
+                        opacity=0.0,   # hidden until estimation runs
+                    ),
+
+                    # Detection-point marker
+                    dl.Marker(
+                        id="detection-marker",
+                        position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
+                        children=[dl.Tooltip("First detection")],
+                        opacity=0.0,
+                    ),
                 ],
             ),
 
-            # ---- Workflow hint banner ----
+            # ---- Placement hint banner ----
             html.Div(
-                id="workflow-hint-banner",
+                id="placement-hint-banner",
                 style={
-                    "position":      "absolute",
-                    "bottom":        "20px",
-                    "left":          "50%",
-                    "transform":     "translateX(-50%)",
-                    "zIndex":        1000,
-                    "pointerEvents": "none",
-                    "whiteSpace":    "nowrap",   # prevent wrapping
+                    "position": "absolute", "bottom": "20px",
+                    "left": "50%", "transform": "translateX(-50%)",
+                    "zIndex": 1000, "pointerEvents": "none",
+                    "whiteSpace": "nowrap",
                 },
                 children=[
                     html.Span(
-                        id="workflow-hint-text",
-                        style={
-                            "background":    "rgba(13,17,23,0.88)",
-                            "color":         "#ff9800",
-                            "padding":       "7px 18px",
-                            "borderRadius":  "4px",
-                            "fontFamily":    "monospace",
-                            "fontSize":      "12px",
-                            "letterSpacing": "0.06em",
-                            "border":        "1px solid #ff9800",
-                            "whiteSpace":    "nowrap",
-                            "display":       "inline-block",
-                        }
+                        id="placement-hint-text",
+                        style=_hint_style("#69f0ae"),
                     )
                 ]
             ),
+
+            # ---- Hidden counters used to drive EditControl programmatically ----
+            dcc.Store(id="draw-trigger-store", data=0),
+            dcc.Store(id="clear-trigger-store", data=0),
 
             # ---- Contamination alert badge ----
             html.Div(
                 id="contam-alert-badge",
                 style={
-                    "position":      "absolute",
-                    "top":           "12px",
-                    "left":          "50%",
-                    "transform":     "translateX(-50%)",
-                    "zIndex":        1000,
-                    "display":       "none",
+                    "position": "absolute", "top": "12px",
+                    "left": "50%", "transform": "translateX(-50%)",
+                    "zIndex": 1000, "display": "none",
                     "pointerEvents": "none",
                 },
                 children=[
                     html.Span(
-                        "⚠ CONTAMINATION DETECTED — BACKTRACKING",
+                        id="contam-alert-text",
+                        children="⚠ CONTAMINATION DETECTED",
                         style={
-                            "background":    "#ff1744",
-                            "color":         "white",
-                            "padding":       "6px 16px",
-                            "borderRadius":  "4px",
-                            "fontFamily":    "monospace",
-                            "fontWeight":    "700",
-                            "fontSize":      "13px",
-                            "letterSpacing": "0.08em",
+                            "background":    "#ff1744", "color": "white",
+                            "padding":       "6px 16px", "borderRadius": "4px",
+                            "fontFamily":    "monospace", "fontWeight": "700",
+                            "fontSize":      "13px", "letterSpacing": "0.08em",
                         }
                     )
                 ]
@@ -184,128 +174,180 @@ def layout():
     )
 
 
-def register_callbacks(app, sim_state , buoy_dt_instance ):
+def register_callbacks(app, sim_state, buoy_dt_instance):
 
     # ------------------------------------------------------------------
-    # Main drawing callback — dispatches to the correct setup step
+    # Polyline drawn -> rebuild and persist the river.
+    # ------------------------------------------------------------------
+    @app.callback(
+        Output("clear-trigger-store", "data"),
+        Input("draw-control", "geojson"),
+        State("clear-trigger-store", "data"),
+        prevent_initial_call=True,
+    )
+    def on_polyline_drawn(geojson, clear_counter):
+        if not geojson or not geojson.get("features"):
+            return no_update
+        latest = geojson["features"][-1]
+        geom = latest.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            return no_update
+        coords = [(c[1], c[0]) for c in geom["coordinates"]]
+
+        mode = sim_state.placement_mode
+        next_clear = (clear_counter or 0) + 1
+
+        if mode == sim_state.PLACE_RIVER:
+            if len(coords) < 2:
+                sim_state.set_toast("Need >=2 points along the river", "#ff9800")
+            else:
+                sim_state.set_drawn_centerline(coords)
+                sim_state.set_placement_mode(sim_state.PLACE_NONE)
+                sim_state.set_toast("River updated and saved.", "#69f0ae", duration_s=5.0)
+            return next_clear
+
+        if mode == sim_state.PLACE_WIDTH:
+            if len(coords) < 2:
+                sim_state.set_toast("Need a 2-point line across the river", "#ff9800")
+            else:
+                sim_state.set_drawn_width(coords)
+                sim_state.set_placement_mode(sim_state.PLACE_NONE)
+            return next_clear
+
+        sim_state.set_toast("Arm DRAW RIVER or DRAW WIDTH first.", "#ff9800")
+        return next_clear
+
+    # ------------------------------------------------------------------
+    # Drive EditControl programmatically:
+    #   - bump draw-trigger-store  -> activate polyline draw tool
+    #   - bump clear-trigger-store -> clear shapes after we ingest them
+    # ------------------------------------------------------------------
+    @app.callback(
+        Output("draw-control", "drawToolbar"),
+        Input("draw-trigger-store", "data"),
+        prevent_initial_call=True,
+    )
+    def trigger_draw(n):
+        if not n:
+            return no_update
+        return {"mode": "polyline", "n_clicks": n}
+
+    @app.callback(
+        Output("draw-control", "editToolbar"),
+        Input("clear-trigger-store", "data"),
+        prevent_initial_call=True,
+    )
+    def trigger_clear(n):
+        if not n:
+            return no_update
+        return {"mode": "remove", "action": "clear all", "n_clicks": n}
+
+    # ------------------------------------------------------------------
+    # Map click → place source / buoy depending on armed mode
+    # The visible markers refresh on the next live-update tick (~1s).
+    # ------------------------------------------------------------------
+    @app.callback(
+        Output("satellite-map", "n_clicks"),   # dummy output; we mutate sim_state in place
+        Input("satellite-map", "clickData"),
+        prevent_initial_call=True,
+    )
+    def on_map_click(click_data):
+        if not click_data:
+            return no_update
+        latlng = click_data.get("latlng") if isinstance(click_data, dict) else None
+        if not latlng:
+            return no_update
+        lat, lon = latlng["lat"], latlng["lng"]
+        sim_state.handle_map_click(lat, lon)
+        # update_map will refresh the markers + hint on the next live-update tick
+        return no_update
+
+    # ------------------------------------------------------------------
+    # Live marker + track + alert badge + centerline overlay + hint
     # ------------------------------------------------------------------
     @app.callback(
         Output("river-centerline-overlay", "positions"),
-        Output("workflow-hint-text",        "children"),
-        Output("workflow-hint-text",        "style"),
-        Input("draw-control", "geojson"),
-        prevent_initial_call=True,
-    )
-    def on_drawing_complete(geojson):
-        """
-        Dispatch each completed drawing to the appropriate setup step.
-
-        Step 0 — expects a polyline (width measurement)
-        Step 1 — expects a polyline (river centreline)
-        Step 2 — expects a marker  (buoy start position)
-        """
-        hint, color = sim_state.step_hint, _STEP_COLORS.get(sim_state.setup_step, "#8b949e")
-
-        if not geojson or not geojson.get("features"):
-            return _no_change(hint, color)
-
-        # Find the most recently added feature (last in list)
-        latest = geojson["features"][-1]
-        geom   = latest["geometry"]
-
-        # ---------- Step 0: width line ----------
-        if sim_state.setup_step == 0:
-            if geom["type"] == "LineString":
-                coords = [(c[1], c[0]) for c in geom["coordinates"]]
-                sim_state.set_gps_width(coords)
-                hint  = sim_state.step_hint
-                color = _STEP_COLORS[sim_state.setup_step]
-            else:
-                hint = "⚠ Please draw a LINE across the river for width measurement"
-
-        # ---------- Step 1: river centreline ----------
-        elif sim_state.setup_step == 1:
-            if geom["type"] == "LineString":
-                coords = [(c[1], c[0]) for c in geom["coordinates"]]
-                if len(coords) < 2:
-                    hint = "⚠ Draw at least 2 points along the river"
-                else:
-                    sim_state.set_gps_polyline(coords)
-                    hint  = sim_state.step_hint
-                    color = _STEP_COLORS[sim_state.setup_step]
-            else:
-                hint = "⚠ Please draw a POLYLINE along the river centreline"
-
-        # ---------- Step 2: buoy start marker ----------
-        elif sim_state.setup_step == 2:
-            if geom["type"] == "Point":
-                lon, lat = geom["coordinates"]
-                sim_state.set_buoy_start_gps(lat, lon)
-                hint  = sim_state.step_hint
-                color = _STEP_COLORS[sim_state.setup_step]
-            else:
-                hint = "⚠ Please place a MARKER for the buoy starting position"
-
-        overlay = sim_state.get_river_overlay_gps()
-        style   = _hint_style(color)
-        return overlay, hint, style
-
-    # ------------------------------------------------------------------
-    # Buoy marker + track + contamination badge — live update
-    # ------------------------------------------------------------------
-    @app.callback(
-        Output("buoy-marker",        "position"),
-        Output("buoy-track",         "positions"),
-        Output("buoy-popup",         "children"),
-        Output("contamination-marker" ,  "position"), 
-        Output("contam-alert-badge", "style"),
+        Output("buoy-marker",              "position"),
+        Output("buoy-start-marker",        "position", allow_duplicate=True),
+        Output("source-marker",            "position", allow_duplicate=True),
+        Output("buoy-track",               "positions"),
+        Output("contam-alert-badge",       "style"),
+        Output("contam-alert-text",        "children"),
+        Output("detection-marker",         "position"),
+        Output("detection-marker",         "opacity"),
+        Output("estimated-source-marker",  "position"),
+        Output("estimated-source-marker",  "opacity"),
+        Output("placement-hint-text",      "children"),
+        Output("placement-hint-text",      "style"),
         Input("live-update-interval", "n_intervals"),
+        prevent_initial_call="initial_duplicate",
     )
-    def update_buoy_on_map(_):
-        lat = buoy_dt_instance.lat or config.MAP_DEFAULT_LAT
-        lon = buoy_dt_instance.lon or config.MAP_DEFAULT_LON
-        pos = [lat, lon]
+    def update_map(_):
+        overlay = sim_state.get_river_overlay_gps()
 
-        track = list(buoy_dt_instance.buoy_history_gps)   # moved to buoy_dt
+        lat = buoy_dt_instance.lat if buoy_dt_instance.lat is not None else config.MAP_DEFAULT_LAT
+        lon = buoy_dt_instance.lon if buoy_dt_instance.lon is not None else config.MAP_DEFAULT_LON
+        buoy_pos = [lat, lon]
 
-        popup_text = (
-            f"Lat: {lat:.6f}\n"
-            f"Lon: {lon:.6f}\n"
-            f"Stream x: {buoy_dt_instance.local_x:.1f} m\n" if buoy_dt_instance.local_x else
-            f"Stream x: --\n"
-            f"Step: {sim_state.sim_time}"
-        )
+        if buoy_dt_instance.start_local is not None and sim_state.georef.is_set:
+            sx, sy = buoy_dt_instance.start_local
+            start_lat, start_lon = sim_state.georef.sim_cartesian_to_gps(sx, sy)
+            start_pos = [start_lat, start_lon]
+        else:
+            start_pos = [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
 
+        src_pos = list(sim_state.source_gps) if sim_state.source_gps else \
+                  [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
+
+        track = [list(p) for p in buoy_dt_instance.buoy_history_gps
+                 if p[0] is not None and p[1] is not None]
+
+        sev = sim_state.contamination_severity
         badge_style = {
             "position": "absolute", "top": "12px", "left": "50%",
             "transform": "translateX(-50%)", "zIndex": 1000,
             "display": "block" if sim_state.contamination_detected else "none",
             "pointerEvents": "none",
         }
+        if sev == "critical":
+            alert_text = "🚨 CRITICAL — " + ", ".join(sim_state.contamination_rules_hit[:3])
+        elif sev == "warning":
+            alert_text = "⚠ WARNING — " + ", ".join(sim_state.contamination_rules_hit[:3])
+        else:
+            alert_text = "Contamination detected"
 
-        cont_gps = sim_state.contamination_gps
-        pos_cont = list(cont_gps) if cont_gps else [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
+        if sim_state.contamination_detected:
+            det_pos = list(sim_state.contamination_gps)
+            det_opacity = 1.0
+        else:
+            det_pos = [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
+            det_opacity = 0.0
 
-        return pos, track, popup_text, pos_cont, badge_style
+        est = sim_state.get_estimated_source_gps()
+        if est is not None:
+            est_pos = list(est)
+            est_opacity = 1.0
+        else:
+            est_pos = [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
+            est_opacity = 0.0
 
-    # ------------------------------------------------------------------
-    # Workflow hint on initial load
-    # ------------------------------------------------------------------
-    @app.callback(
-        Output("workflow-hint-text", "children", allow_duplicate=True),
-        Output("workflow-hint-text", "style",    allow_duplicate=True),
-        Input("live-update-interval", "n_intervals"),
-        prevent_initial_call="initial_duplicate",
-    )
-    def refresh_hint(_):
-        color = _STEP_COLORS.get(sim_state.setup_step, "#8b949e")
-        return sim_state.step_hint, _hint_style(color)
+        toast_text, toast_color = sim_state.get_toast()
+        if toast_text is not None:
+            hint, color = toast_text, toast_color
+        else:
+            hint = sim_state.placement_hint
+            color = "#ff9800" if sim_state.placement_mode else "#69f0ae"
+
+        return (overlay, buoy_pos, start_pos, src_pos, track,
+                badge_style, alert_text,
+                det_pos, det_opacity,
+                est_pos, est_opacity,
+                hint, _hint_style(color))
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
-
 def _hint_style(color: str) -> dict:
     return {
         "background":    "rgba(13,17,23,0.88)",
@@ -317,6 +359,3 @@ def _hint_style(color: str) -> dict:
         "letterSpacing": "0.06em",
         "border":        f"1px solid {color}",
     }
-
-def _no_change(hint, color):
-    return [], hint, _hint_style(color)

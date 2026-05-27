@@ -47,6 +47,74 @@ class GeoReference:
         self._origin_lon = points[0][1]
         self._is_set = True
 
+    def preload_from_origin(
+        self,
+        origin_lat: float,
+        origin_lon: float,
+        heading_rad: float,
+        topology: list,
+        ds_length: float,
+    ):
+        """
+        Bypass GPS-polyline drawing: anchor the (already-known) river topology
+        at a fixed GPS origin with a chosen heading.
+
+        Used for preloaded river segments (abstract Meuse) where the user
+        does not draw the centerline on the map.
+        """
+        self._origin_lat = float(origin_lat)
+        self._origin_lon = float(origin_lon)
+        self._is_set = True
+        # Synthesize a 2-point gps_points list so any downstream code that
+        # peeks at gps_points[0] still works.
+        self.gps_points = [(origin_lat, origin_lon),
+                           (origin_lat + 1e-4, origin_lon + 1e-4)]
+        # Run the standard discretization, but override the heading
+        # computed from gps_points with the caller-supplied value.
+        self._build_with_heading(topology, ds_length, heading_rad)
+
+    def _build_with_heading(self, topology: list, ds_length: float, heading_rad: float):
+        """Internal: same as build_discretized_tree but uses a given heading."""
+        self.ds_length = ds_length
+        self.heading = float(heading_rad)
+
+        x_cl, y_cl = [0.0], [0.0]
+        theta = 0.0
+        for seg_type, measures in topology:
+            if seg_type == 0:
+                n_steps = max(1, int(measures / ds_length))
+                for _ in range(n_steps):
+                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
+                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
+            elif seg_type == 1:
+                radius, angle_deg = measures
+                n_steps = max(1, int((radius * abs(np.radians(angle_deg))) / ds_length))
+                d_theta = np.radians(angle_deg) / n_steps
+                for _ in range(n_steps):
+                    theta += d_theta
+                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
+                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
+
+        self.xc = np.array(x_cl)
+        self.yc = np.array(y_cl)
+
+        dx_arr = np.gradient(self.xc)
+        dy_arr = np.gradient(self.yc)
+        lengths = np.sqrt(dx_arr**2 + dy_arr**2)
+        lengths[lengths == 0] = 1e-9
+        self.nx_m = -dy_arr / lengths
+        self.ny_m = dx_arr / lengths
+
+        self.sim_tree = cKDTree(np.column_stack((self.xc, self.yc)))
+
+        c, s = np.cos(self.heading), np.sin(self.heading)
+        x_rot = self.xc * c - self.yc * s
+        y_rot = self.xc * s + self.yc * c
+        self.gps_lats = self._origin_lat + y_rot / METRES_PER_DEG_LAT
+        self.gps_lons = self._origin_lon + x_rot / metres_per_deg_lon(self._origin_lat)
+
+        self._is_built = True
+
     def to_river_topology(self, bend_radius=60.0, merge_window_m=400.0, min_angle_deg=2.0) -> list:
         """Converts raw GPS polyline to (straight/bend) topology."""
         pts = self.gps_points
@@ -95,57 +163,13 @@ class GeoReference:
     # ------------------------------------------------------------------
 
     def build_discretized_tree(self, topology: list, ds_length: float):
-        self.ds_length = ds_length
-        
-        # Calculate Initial Real-World Heading from GPS
+        # Derive heading from first two GPS points (drawing path).
         lat0, lon0 = self.gps_points[0]
         lat1, lon1 = self.gps_points[1]
         dx = (lon1 - lon0) * metres_per_deg_lon(lat0)
         dy = (lat1 - lat0) * METRES_PER_DEG_LAT
-        self.heading = np.arctan2(dy, dx)
-
-        # Build Unrotated Centerline (Matches Simulation Exactly)
-        x_cl, y_cl = [0.0], [0.0]
-        theta = 0.0  
-        
-        for seg_type, measures in topology:
-            if seg_type == 0:
-                n_steps = max(1, int(measures / ds_length))
-                for _ in range(n_steps):
-                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
-                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
-            elif seg_type == 1:
-                radius, angle_deg = measures
-                n_steps = max(1, int((radius * abs(np.radians(angle_deg))) / ds_length))
-                d_theta = np.radians(angle_deg) / n_steps
-                for _ in range(n_steps):
-                    theta += d_theta
-                    x_cl.append(x_cl[-1] + ds_length * np.cos(theta))
-                    y_cl.append(y_cl[-1] + ds_length * np.sin(theta))
-
-        self.xc = np.array(x_cl)
-        self.yc = np.array(y_cl)
-
-        # Compute normal vectors in Unrotated Space
-        dx_arr = np.gradient(self.xc)
-        dy_arr = np.gradient(self.yc)
-        lengths = np.sqrt(dx_arr**2 + dy_arr**2)
-        lengths[lengths == 0] = 1e-9
-        self.nx_m = -dy_arr / lengths
-        self.ny_m = dx_arr / lengths
-
-        # Build KDTree in UNROTATED Simulation Space
-        self.sim_tree = cKDTree(np.column_stack((self.xc, self.yc)))
-
-        #  Pre-calculate GPS coords (Apply Rotation to World Space)
-        c, s = np.cos(self.heading), np.sin(self.heading)
-        x_rot = self.xc * c - self.yc * s
-        y_rot = self.xc * s + self.yc * c
-
-        self.gps_lats = self._origin_lat + y_rot / METRES_PER_DEG_LAT
-        self.gps_lons = self._origin_lon + x_rot / metres_per_deg_lon(self._origin_lat)
-        
-        self._is_built = True
+        heading = np.arctan2(dy, dx)
+        self._build_with_heading(topology, ds_length, heading)
 
     def gps_to_local(self, lat: float, lon: float) -> tuple[float, float]:
         """Convert GPS back to unrotated simulation Cartesian coordinates (x, y)."""

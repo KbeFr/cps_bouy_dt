@@ -222,8 +222,12 @@ class BuoyEKF5:
     def position(self, value: tuple[float, float]):
         if len(value) != 2:
             raise ValueError("Position must be a tuple of (x, y)")
-        
-        self.x = [float(value[0]), float(value[1])]
+        # Mutate the 5-state vector in place; never replace it (would destroy
+        # velocity + heading state).
+        if self.x is None:
+            self.x = np.zeros(5, dtype=float)
+        self.x[0] = float(value[0])
+        self.x[1] = float(value[1])
 
     @property
     def velocity_sim(self) -> tuple[float, float]:
@@ -341,10 +345,9 @@ class BuoyParticle:
         self.y = value[1]
 
 
-    @property
-    def spoofed_gps(self) -> tuple[float, float]:
-        """Sim position expressed as GPS — for ThingsBoard map display."""
-        return self.river.georef.sim_cartesian_to_gps(self.x, self.y)
+    def spoofed_gps(self, georef) -> tuple[float, float]:
+        """Sim position expressed as GPS — caller supplies the georef."""
+        return georef.sim_cartesian_to_gps(self.x, self.y)
 
 
 # =============================================================================
