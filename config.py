@@ -116,7 +116,20 @@ DEFAULT_SOURCE_INTENSITY = 200.0
 
 DEFAULT_N_PARTICLES    = 200
 
-# --- Backtrack Defaults ---
+# Ignore very faint numerical plume tails when synthesizing SIM sensor values.
+# This prevents the buoy from continuing to raise warning detections long after
+# it has effectively left the visible/meaningful plume.
+SIM_SENSOR_MIN_INTENSITY = 0.03
+
+# --- Estimator (Bayesian profile-likelihood) ---
+# Effective observation noise (units: same as the pollution score 0..1).
+# Larger sigma => softer posterior (wider credible region).
+# Calibrated so a typical buoy detection's residual is roughly sigma-sized.
+ESTIMATOR_NOISE_SIGMA = 0.15
+# Cap on iterations through the measurement log when extremely large.
+ESTIMATOR_MAX_MEASUREMENTS = 2000
+
+# --- Backtrack Defaults (kept for backwards compatibility — unused) ---
 BACKTRACK_N_PARTICLES_PER_HIT = 400   # released per logged elevated reading
 BACKTRACK_T_SECONDS           = 300   # seconds of backward integration
 BACKTRACK_DT                  = 2.0   # integration step (s)

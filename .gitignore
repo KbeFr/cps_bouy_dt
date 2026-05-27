@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+.venv_broken_*/
+venv/
+env/
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+# Local environment files
+.env
+.env.*
+# IDE / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+
+
+
+

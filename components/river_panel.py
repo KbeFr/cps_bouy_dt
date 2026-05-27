@@ -40,6 +40,52 @@ def _empty_fig(title: str = "Waiting for river model...") -> go.Figure:
     return fig
 
 
+def _carpet_field_traces(river, values, colorscale, zmin, zmax,
+                         name: str = ""):
+    """
+    Render a 2-D scalar field on the river's curvilinear grid using a
+    Carpet + Contourcarpet trace.
+
+    Plotly's Carpet is designed exactly for this case: a parametric (a, b)
+    grid mapped to physical (x, y) coordinates, with field values overlaid
+    via filled contours.  Unlike scatter markers it tiles the grid without
+    gaps or overlap artifacts, so cross-stream gradients render cleanly.
+
+    Returns a list of two traces (the invisible carpet + the contour layer).
+    """
+    N, M = river.vis_x.shape
+    a = np.arange(N)
+    b = np.arange(M)
+
+    carpet = go.Carpet(
+        carpet="riverc",
+        a=a, b=b,
+        x=river.vis_x, y=river.vis_y,
+        aaxis=dict(showgrid=False, showticklabels="none", showline=False,
+                   minorgridcount=0, smoothing=0),
+        baxis=dict(showgrid=False, showticklabels="none", showline=False,
+                   minorgridcount=0, smoothing=0),
+        opacity=0.0,
+    )
+    contour = go.Contourcarpet(
+        carpet="riverc",
+        a=a, b=b,
+        z=values,
+        colorscale=colorscale, zmin=zmin, zmax=zmax,
+        contours=dict(coloring="fill", showlines=False, start=zmin, end=zmax,
+                      size=max(1e-3, (zmax - zmin) / 30.0)),
+        line=dict(width=0),
+        colorbar=dict(
+            title=dict(text=name, font=dict(color="#cdd9e5", size=10)),
+            thickness=10, len=0.9,
+            x=1.01, xanchor="left", y=0.5, yanchor="middle",
+            tickfont=dict(color="#cdd9e5", size=9),
+        ),
+        showlegend=False,
+    )
+    return [carpet, contour]
+
+
 def _bank_traces(river) -> list:
     """Left and right bank lines as Scattergl traces."""
     return [
@@ -382,28 +428,43 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
                     name="Estimated source",
                 ))
             if sim_state.detection_history:
-                xs = [d["x_local"] for d in sim_state.detection_history]
-                ys = [d["y_local"] for d in sim_state.detection_history]
-                ints = [float(d.get("intensity", 0.0)) for d in sim_state.detection_history]
+                xs    = [d["x_local"]                          for d in sim_state.detection_history]
+                ys    = [d["y_local"]                          for d in sim_state.detection_history]
+                # Colour by ABSOLUTE concentration (not the c/cmax ratio).
+                # The ratio rescales every tick as the field evolves which can
+                # invert the apparent colour ordering between detection points.
+                concs = [float(d.get("conc", d.get("intensity", 0.0)))
+                         for d in sim_state.detection_history]
+                # Stable colour scale: 0 .. (peak of forward plume at this moment).
+                # Falls back to the recorded max so values are always normalised
+                # against something visible.
+                cmax_field = 0.01
+                if sim_state.dv is not None:
+                    try:
+                        cmax_field = max(cmax_field, float(sim_state.dv.get_concentration_map().max()))
+                    except Exception:
+                        pass
+                cmax_eff = max(cmax_field, max(concs) if concs else 0.01)
                 fig.add_trace(go.Scattergl(
                     x=xs, y=ys, mode="markers",
                     marker=dict(
-                        color=ints,
-                        cmin=0.0, cmax=max(0.01, max(ints)),
-                        colorscale=[[0.0, "#ffeb3b"], [0.5, "#ff9800"], [1.0, "#b71c1c"]],
-                        size=10, symbol="x",
-                        line=dict(color="white", width=1.5),
+                        color=concs,
+                        cmin=0.0,
+                        cmax=cmax_eff,
+                        colorscale="Reds",     # pale pink (low) -> deep red (high), unambiguous
+                        size=5, symbol="circle",
+                        line=dict(width=0),
                         colorbar=dict(
-                            title=dict(text="Detection<br>intensity",
+                            title=dict(text="Local<br>concentration",
                                        font=dict(color="#cdd9e5", size=10)),
                             thickness=10, len=0.4,
-                            x=1.11, xanchor="left",   # sits to the RIGHT of the velocity colorbar
+                            x=1.11, xanchor="left",
                             y=0.25, yanchor="middle",
                             tickfont=dict(color="#cdd9e5", size=9),
                         ),
                     ),
                     name="Detections",
-                    hovertemplate="x: %{x:.0f} m<br>y: %{y:.0f} m<br>intensity: %{marker.color:.2f}<extra></extra>",
+                    hovertemplate="x: %{x:.0f} m<br>y: %{y:.0f} m<br>c: %{marker.color:.3f}<extra></extra>",
                 ))
 
         return get_graph_children(figures)

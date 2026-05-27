@@ -84,7 +84,7 @@ class SimulationState:
         # plot can show the full track of contamination encounters.
         self.detection_history: list[dict] = []
         self._last_detection_sample_t: float = -1e9
-        self.DETECTION_SAMPLE_S = 5.0
+        self.DETECTION_SAMPLE_S = 15.0   # seconds between detection-history samples
 
         # --- Measurement log (for batch backtracking) ---
         # Each entry: dict(t, lat, lon, x_local, y_local, ph, ec, do, severity)
@@ -374,7 +374,10 @@ class SimulationState:
 
         # Apply the speed multiplier in SIM mode only; REAL mode stays 1:1.
         speed = self.speed_multiplier if self.mode == BuoyMode.SIM else 1.0
-        dt = min(5.0, wall_dt * speed)        # cap per-step dt to keep integration stable
+        # Cap per-tick sim-time. With 50x speed and a 0.5s wall tick that's
+        # 25 s of sim-time per call; we allow up to 30 s before clamping so
+        # the slider actually delivers its requested speed.
+        dt = min(30.0, wall_dt * speed)
 
         self.sim_time += dt
 
@@ -425,6 +428,8 @@ class SimulationState:
 
         cmax = float(cmap.max() or 1.0)
         raw_intensity = max(0.0, min(1.0, c / cmax))
+        if raw_intensity < getattr(config, "SIM_SENSOR_MIN_INTENSITY", 0.0):
+            raw_intensity = 0.0
         # Non-linear sensor dose-response.  Real ion-selective probes and
         # spectrophotometric sensors saturate quickly: even low-concentration
         # contamination produces large reading shifts because the threshold
@@ -448,6 +453,43 @@ class SimulationState:
         # Stash for callers (logger, history)
         self._last_concentration = c
         self._last_intensity = raw_intensity
+
+    # ------------------------------------------------------------------
+    # Pollution score (used by estimator as the observed concentration)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def pollution_score(ph: float | None, ec: float | None, do: float | None) -> float:
+        """
+        Map raw pH/EC/DO readings to a single [0, 1] "pollution-likeness" score.
+
+        Each sensor contributes a per-channel score in [0, 1] based on how far
+        it has deviated from its clean-water baseline toward the configured
+        critical alarm threshold:
+
+          pH deviation toward 9.0 (alkaline) or 6.0 (acidic):   [0, 1]
+          EC rising from 400 toward 1000 µS/cm:                 [0, 1]
+          DO falling from 9.0 toward 5.0 mg/L:                  [0, 1]
+
+        The overall score is the MEAN over contributing sensors — this
+        averages out single-sensor noise while still rewarding consensus
+        between channels. Returns 0.0 when no readings are available.
+
+        This is the value the Bayesian estimator treats as the "observed
+        concentration" c_obs in its likelihood — it works equally well in
+        SIM mode (where the readings are synthesised) and REAL mode (where
+        they come straight from the ThingsBoard live feed).
+        """
+        scores = []
+        if ph is not None:
+            if ph >= 7.5:
+                scores.append(max(0.0, min(1.0, (ph - 7.5) / (9.0 - 7.5))))
+            else:
+                scores.append(max(0.0, min(1.0, (7.5 - ph) / (7.5 - 6.0))))
+        if ec is not None:
+            scores.append(max(0.0, min(1.0, (ec - 400.0) / (1000.0 - 400.0))))
+        if do is not None:
+            scores.append(max(0.0, min(1.0, (9.0 - do) / (9.0 - 5.0))))
+        return float(np.mean(scores)) if scores else 0.0
 
     # ------------------------------------------------------------------
     # Logging + alarm rule evaluation
@@ -504,6 +546,7 @@ class SimulationState:
             "n_sensors_triggered": len(by_key_severity),
             "intensity":  getattr(self, "_last_intensity", 0.0),
             "conc":       getattr(self, "_last_concentration", 0.0),
+            "pollution_score": self.pollution_score(ph, ec, do),
         }
         self.measurement_log.append(entry)
         if len(self.measurement_log) > 5000:
@@ -590,96 +633,149 @@ class SimulationState:
         dn = r.dn
         U  = max(0.1, float(config.DEFAULT_U_AVG))
         D_T = max(1e-3, float(config.DEFAULT_D_T))
+        sigma2 = float(getattr(config, "ESTIMATOR_NOISE_SIGMA", 0.15)) ** 2
 
-        # Pre-extract candidate-cell array indices (i_s, j_s for every cell).
-        # Score grid will be indexed [i_s, j_s] just like vis_v.
-        score = np.zeros((n_stream, n_width), dtype=np.float64)
-
-        # Pre-compute buoy stream/cross indices for every measurement
-        # via the river's KDTree (fast batch query).
+        # ----- 1. Gather georeferenced measurements -----
         valid_measurements = [
             m for m in self.measurement_log
             if m["x_local"] is not None and m["y_local"] is not None
         ]
-        pts = np.array([[m["x_local"], m["y_local"]] for m in valid_measurements])
-        if len(pts) == 0:
+        # Cap to most-recent N if log is very long (keeps newest evidence)
+        max_meas = int(getattr(config, "ESTIMATOR_MAX_MEASUREMENTS", 2000))
+        if len(valid_measurements) > max_meas:
+            valid_measurements = valid_measurements[-max_meas:]
+        if not valid_measurements:
             print("[Estimator] No georeferenced measurements.")
             self.backtrack_map = None
             return
+
+        pts = np.array([[m["x_local"], m["y_local"]] for m in valid_measurements])
         _, b_flat = r.physics_tree.query(pts, k=1)
         b_i_all = (b_flat // n_width).astype(int)
         b_j_all = (b_flat %  n_width).astype(int)
 
-        # Severity → weight (positive evidence)
-        sev_w = {"critical": 3.0, "warning": 1.0}
-        # Penalty for a candidate predicting a plume where buoy saw nothing
-        # (smaller than positive evidence — false-negative rate higher than FP).
-        NEG_W = 0.4
-        # Floor for log-likelihood concentration normalisation
-        EPS = 1e-6
+        # ----- 2. Build observation vector c_obs (length M) -----
+        # Prefer the raw concentration value (SIM mode: directly from DV field;
+        # always has the widest dynamic range and best discrimination).
+        # In REAL mode fall back to inverting the sensor dose-response curve
+        # used by _synthesize_sim_sensors: eff = score, intensity = eff^(1/0.35).
+        # This restores the linear-in-concentration scale the analytic plume
+        # model expects, so the profile-MLE for Q is unbiased.
+        def _obs_for_estimator(m: dict) -> float:
+            c = m.get("conc", 0.0) or 0.0
+            if c > 0.0:
+                return float(c)
+            score = m.get("pollution_score",
+                          self.pollution_score(m.get("ph"), m.get("ec"), m.get("do")))
+            if score <= 0.0:
+                return 0.0
+            return float(score) ** (1.0 / 0.35)   # undo sqrt-style compression
 
-        n_det = 0
-        n_neg = 0
-        # Iterate measurements (compact log = each tick) — vectorise over candidates
+        c_obs = np.array([_obs_for_estimator(m) for m in valid_measurements],
+                         dtype=np.float64)
+
+        # ----- 3. For each candidate cell s, build "shape function" g_k(s) =
+        #         analytic-plume value at measurement k assuming source at s
+        #         with UNIT strength.  Then maximize over Q analytically:
+        #
+        #             Q*(s) = (Σ_k g_k(s) c_obs_k)  /  (Σ_k g_k(s)²)
+        #
+        #         Profile log-likelihood (Q marginalised at MLE):
+        #
+        #             log L(s) = - ||c_obs - Q*(s)·g(s)||² / (2σ²)
+        #                      = - (||c||² - Q*² · Σg²) / (2σ²)
+        #
+        # We accumulate Σg², Σ(g·c) over measurements in one vectorised pass.
+        # -----
         i_grid, j_grid = np.meshgrid(np.arange(n_stream), np.arange(n_width),
                                      indexing="ij")
+        sum_g2 = np.zeros((n_stream, n_width), dtype=np.float64)
+        sum_gc = np.zeros((n_stream, n_width), dtype=np.float64)
+        sum_c2 = float(np.sum(c_obs ** 2))
 
-        for m_idx, m in enumerate(valid_measurements):
-            b_i = int(b_i_all[m_idx])
-            b_j = int(b_j_all[m_idx])
-            sev = m.get("severity")
+        for k, m in enumerate(valid_measurements):
+            b_i = int(b_i_all[k]); b_j = int(b_j_all[k])
 
-            # Vectorised analytic plume from every candidate cell s → buoy b
-            d_s = (b_i - i_grid) * ds                     # downstream distance
-            d_n = (b_j - j_grid) * dn                     # lateral offset
-            valid = d_s > ds                              # buoy must be downstream
+            # Analytic Gaussian continuous-source plume (advection-dominated)
+            d_s = (b_i - i_grid) * ds                    # downstream distance
+            d_n = (b_j - j_grid) * dn                    # lateral offset
+            valid = d_s > ds                             # buoy must be downstream
             with np.errstate(divide="ignore", invalid="ignore"):
-                c_pred = np.where(
+                g = np.where(
                     valid,
                     (1.0 / np.sqrt(np.maximum(d_s, ds))) *
                     np.exp(-(d_n * d_n * U) / (4.0 * D_T * np.maximum(d_s, ds))),
                     0.0,
                 )
+            sum_g2 += g * g
+            sum_gc += g * c_obs[k]
 
-            if sev is not None:
-                # Positive evidence: candidates whose plume reaches the buoy
-                # are MORE likely to be the true source.
-                score += sev_w.get(sev, 1.0) * c_pred
-                n_det += 1
-            else:
-                # Negative evidence: penalise candidates whose plume WOULD
-                # have been seen (subtract a fraction of the expected signal).
-                score -= NEG_W * c_pred
-                n_neg += 1
+        # ----- 4. Profile-MLE for source strength Q at every candidate -----
+        # eps avoids divide-by-zero for cells that no measurement could see.
+        eps = max(1e-9, 1e-6 * float(sum_g2.max() or 1.0))
+        Q_star = sum_gc / (sum_g2 + eps)
+        Q_star = np.clip(Q_star, 0.0, None)              # Q ≥ 0 prior
 
-        # Convert score to probability map
-        score = np.clip(score, 0.0, None)
-        total = score.sum()
-        if total <= 0:
-            print("[Estimator] All candidates ruled out. Drop NEG_W or collect more data.")
+        # Residual sum of squares (after substituting Q*):
+        #   ||c - Q*g||² = ||c||² - 2 Q* (g·c) + Q*² (g·g)
+        # at Q* = (g·c)/(g·g)  →  RSS = ||c||² − (g·c)² / (g·g)
+        rss = sum_c2 - (sum_gc * sum_gc) / (sum_g2 + eps)
+        rss = np.maximum(rss, 0.0)
+
+        # Profile log-likelihood (cells with no coverage get -inf-ish penalty)
+        log_L = -rss / (2.0 * sigma2)
+
+        # ----- 5. Convert to probability (softmax with max-subtraction) -----
+        # Mask cells that no measurement could see (their g is identically 0
+        # so RSS = ||c||² — a constant; they get equal probability among
+        # themselves. That's not informative, so down-weight them.)
+        coverage_mask = sum_g2 > 1e-12 * float(sum_g2.max() or 1.0)
+        log_L = np.where(coverage_mask, log_L, log_L.min() - 1e3)
+
+        log_L -= log_L.max()
+        prob = np.exp(log_L)
+        total = prob.sum()
+        if total <= 0 or not np.isfinite(total):
+            print("[Estimator] Degenerate posterior; widen ESTIMATOR_NOISE_SIGMA or collect more data.")
             self.backtrack_map = None
             return
-        prob = score / total
+        prob /= total
 
         self.backtrack_map = prob
         self.backtracking = False
 
+        # ----- 6. Report -----
         i, j = np.unravel_index(np.argmax(prob), prob.shape)
         est_x = float(r.vis_x[i, j])
         est_y = float(r.vis_y[i, j])
+        Q_at_peak = float(Q_star[i, j])
         est_lat, est_lon = self.georef.sim_cartesian_to_gps(est_x, est_y)
 
-        # Distance to true source (if known) — useful diagnostic in SIM mode
+        n_det = sum(1 for m in valid_measurements if m.get("severity"))
+        n_non = len(valid_measurements) - n_det
+
+        # 1-sigma equivalent radius from the posterior (rough credible region)
+        # Estimated by computing the standard deviation of distance from the peak,
+        # weighted by the posterior probability.
+        xs_grid = r.vis_x
+        ys_grid = r.vis_y
+        dx2 = (xs_grid - est_x) ** 2
+        dy2 = (ys_grid - est_y) ** 2
+        var_r = float(np.sum(prob * (dx2 + dy2)))
+        std_r = float(np.sqrt(var_r))
+
         if self.source_local is not None:
             tx, ty = self.source_local
             err = float(np.hypot(est_x - tx, est_y - ty))
-            print(f"[Estimator] {n_det} detections, {n_neg} non-detections "
-                  f"-> peak at local ({est_x:.1f}, {est_y:.1f}); "
-                  f"true source ({tx:.1f}, {ty:.1f}); error = {err:.1f} m")
+            print(f"[Estimator] {len(valid_measurements)} measurements "
+                  f"({n_det} alarms, {n_non} non-alarm); Q*={Q_at_peak:.3f}; "
+                  f"peak ({est_x:.1f}, {est_y:.1f}); true ({tx:.1f}, {ty:.1f}); "
+                  f"error = {err:.1f} m;  1-sigma ~ {std_r:.1f} m")
         else:
-            print(f"[Estimator] {n_det} detections, {n_neg} non-detections "
-                  f"-> peak at local ({est_x:.1f}, {est_y:.1f}) "
-                  f"GPS ({est_lat:.6f}, {est_lon:.6f})")
+            print(f"[Estimator] {len(valid_measurements)} measurements "
+                  f"({n_det} alarms); Q*={Q_at_peak:.3f}; "
+                  f"peak local ({est_x:.1f}, {est_y:.1f}) "
+                  f"GPS ({est_lat:.6f}, {est_lon:.6f});  1-sigma ~ {std_r:.1f} m")
 
     def reset_contamination(self):
         self.contamination_detected = False
@@ -696,6 +792,10 @@ class SimulationState:
         self.sim_time = 0.0
         self._last_tick_t = 0.0
         self.running = False
+        # Reset the detection-sample throttle, otherwise its last-fire time
+        # is stuck at the previous run's sim_time and no new detection points
+        # would be appended until the new run accumulates that much time again.
+        self._last_detection_sample_t = -1e9
 
     def clear_log(self):
         self.measurement_log.clear()

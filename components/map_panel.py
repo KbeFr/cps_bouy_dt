@@ -108,13 +108,20 @@ def layout():
                         children=[dl.Tooltip("Source")],
                     ),
 
-                    # Estimated source marker (from backtracking)
-                    dl.Marker(
+                    # Estimated source — cyan open circle (matches river-model panel)
+                    # Always rendered (some dash-leaflet versions don't mount the
+                    # SVG when initial opacity=0). When there is no estimate yet
+                    # we park it off-screen via the update callback.
+                    dl.CircleMarker(
                         id="estimated-source-marker",
-                        position=[config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON],
-                        icon=blueIcon,
+                        center=[0, 0],            # parked off-screen until estimator fires
+                        radius=10,
+                        color="#00e5ff",
+                        weight=3,
+                        opacity=1.0,
+                        fill=False,               # open circle (no fill)
+                        fillOpacity=0.0,
                         children=[dl.Tooltip("Estimated source (backtrack)")],
-                        opacity=0.0,   # hidden until estimation runs
                     ),
 
                     # Detection-point marker
@@ -275,7 +282,7 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
         Output("contam-alert-text",        "children"),
         Output("detection-marker",         "position"),
         Output("detection-marker",         "opacity"),
-        Output("estimated-source-marker",  "position"),
+        Output("estimated-source-marker",  "center"),
         Output("estimated-source-marker",  "opacity"),
         Output("placement-hint-text",      "children"),
         Output("placement-hint-text",      "style"),
@@ -328,8 +335,10 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
             est_pos = list(est)
             est_opacity = 1.0
         else:
-            est_pos = [config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON]
-            est_opacity = 0.0
+            # Park the circle far off-screen so it isn't visible; keep opacity=1
+            # because dash-leaflet may not re-mount the SVG when toggling opacity.
+            est_pos = [0.0, 0.0]
+            est_opacity = 1.0
 
         toast_text, toast_color = sim_state.get_toast()
         if toast_text is not None:
