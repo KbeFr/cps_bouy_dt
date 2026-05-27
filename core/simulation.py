@@ -279,10 +279,8 @@ class SimulationState:
         )
         
         # Prerun it so there's an initial plume ready to be detected
-        print("RUN")
         for _ in range(150):
             self.dv.update()
-        print("RUN")
 
         # Revert to Ready state
         self.setup_step = 3
