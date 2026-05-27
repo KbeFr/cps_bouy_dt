@@ -16,7 +16,7 @@ from core.global_buoy_dt import BuoyDigitalTwin , BuoyMode
 
 buoy_dt = BuoyDigitalTwin()
 sim_state = SimulationState(buoy_dt)
-
+sim_state.start_sim_thread()
 
 # --- Import panels (after singletons so callbacks can close over them) ---
 from components import control_panel, map_panel, river_panel
@@ -52,10 +52,10 @@ app.layout = html.Div(
     },
     children=[
 
-        # ---- 1. Left sidebar ----
+        # ---- Left sidebar ----
         control_panel.layout(),
 
-        # ---- 2. Centre column (satellite map) ----
+        # ---- Centre column (satellite map) ----
         html.Div(
             style={"flex": "1 1 0", "height": "100vh", "position": "relative",
                    "borderRight": "1px solid #1e2a35"},
@@ -86,7 +86,7 @@ app.layout = html.Div(
             ]
         ),
 
-        # ---- 3. Right column (river model) ----
+        # ----  Right column (river model) ----
         html.Div(
             style={"flex": "1 1 0", "height": "100vh", "display": "flex",
                    "flexDirection": "column"},
@@ -143,11 +143,6 @@ app.layout = html.Div(
     Input("sim-step-interval", "n_intervals"),
 )
 def tick_simulation(_):
-    try:
-        sim_state.step()
-    except Exception as e:
-        print(f"[tick] step error: {e}")
-        import traceback; traceback.print_exc()
     mode = "SIM" if sim_state.mode == BuoyMode.SIM else "REAL"
     return f"t={sim_state.sim_time}  |  mode={mode}  |  {'▶ RUNNING' if sim_state.running else '⏸ PAUSED'}"
 
@@ -166,4 +161,4 @@ river_panel.register_callbacks(app, sim_state, buoy_dt)
 # =============================================================================
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8050)
+    app.run(debug=True, host="0.0.0.0", port=8050, threaded=True)

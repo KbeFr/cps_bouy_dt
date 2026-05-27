@@ -260,7 +260,7 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
                 y=np.arange(r.vis_v.shape[1]),
                 colorscale="Blues",
                 colorbar=dict(title="m/s", thickness=10),
-                hovertemplate="Stream: %{x}<br>Width: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
+                hovertemplate="Width: %{x}<br>Stream: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
             ))
             fig_v.update_layout(
                 **_base_layout("Streamwise Velocity (u)"),

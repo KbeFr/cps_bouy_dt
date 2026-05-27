@@ -2,12 +2,18 @@
 # components/control_panel.py — Left sidebar: controls + live sensor readout
 # =============================================================================
 
-import dash_bootstrap_components as dbc
-from dash import html, dcc, Input, Output, State
-import config
+from dash import html, dcc, Input, Output, State, no_update
+import datetime
+import numpy as np
 
 from core.global_buoy_dt import BuoyDigitalTwin
 from core.simulation import SimulationState
+from core.global_buoy_dt import BuoyMode
+
+from core.river_model.river_config import (
+    RiverConfig, save_config, load_config, list_saved
+)
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -145,29 +151,51 @@ def layout():
 
             # ---- Contamination status ----
             _section("Contamination", [
+                _btn("PLACE SOURCE", "btn-place-source", "#b388ff"),
                 html.Div(id="contam-status-text",
                          style={"color": "#8b949e", "fontSize": "11px",
                                 "fontFamily": "monospace"}),
             ]),
 
-            # ---- Instructions ----
-            html.Div(
-                style={"marginTop": "auto", "paddingTop": "16px",
-                       "borderTop": "1px solid #1e2a35"},
-                children=[
-                    html.Div("HOW TO START", style={"color": "#8b949e", "fontSize": "9px",
-                                                    "fontFamily": "monospace",
-                                                    "letterSpacing": "0.15em",
-                                                    "marginBottom": "6px"}),
-                    html.Ol([
-                        html.Li("Draw river on satellite map"),
-                        html.Li("Click START"),
-                        html.Li("Inject contamination to test backtracking"),
-                    ], style={"color": "#8b949e", "fontSize": "10px",
-                              "fontFamily": "monospace", "paddingLeft": "16px",
-                              "lineHeight": "1.8"}),
-                ]
-            ),
+            # ---- Commands ----
+            _section("Active Command", [
+                _readout("Heading (sim)", "read-cmd-heading", "deg", "#ff9800"),
+                _readout("Thrust",        "read-cmd-thrust",  "",    "#ff9800"),
+                _readout("Reason",        "read-cmd-reason",  "",    "#8b949e"),
+                ]),
+
+            # ── Save / Load river ──────────────────────────────────────
+            _section("River Profile", [
+                html.Div(style={"display":"flex","gap":"5px","marginBottom":"6px"}, children=[
+                    dcc.Input(id="river-name-input", type="text", placeholder="Profile name…",
+                              style={"flex":"1","background":"#0d1520","border":"1px solid #1e2a35",
+                                     "color":"#cdd9e5","fontFamily":"monospace","fontSize":"10px",
+                                     "padding":"4px 6px","borderRadius":"2px"}),
+                    html.Button("SAVE", id="btn-save-river",
+                                style={"background":"transparent","border":"1px solid #1e4a35",
+                                       "color":"#69f0ae","fontFamily":"monospace","fontSize":"9px",
+                                       "padding":"4px 7px","cursor":"pointer","borderRadius":"2px"}),
+                ]),
+                dcc.Dropdown(
+                    id="river-load-dropdown",
+                    placeholder="Load saved profile…",
+                    options=[],
+                    style={"marginBottom":"6px"},
+                    className="dt-dropdown",
+                ),
+                html.Button("⊕  LOAD SELECTED", id="btn-load-river",
+                            style={"background":"transparent","border":"1px solid #1e3a55",
+                                   "color":"#4fc3f7","fontFamily":"monospace","fontSize":"9px",
+                                   "padding":"4px 8px","cursor":"pointer","borderRadius":"2px",
+                                   "width":"100%","marginBottom":"4px","textAlign":"left"}),
+            ]),
+
+            # ── Notification area ──────────────────────────────────────
+            html.Div(id="notification-bar", style={
+                "marginTop":"auto","padding":"6px 8px","borderRadius":"2px",
+                "fontFamily":"monospace","fontSize":"9px","display":"none",
+            }),
+
         ]
     )
 
@@ -189,11 +217,12 @@ def register_callbacks(app, sim_state : SimulationState, buoy_dt_instance : Buoy
         Output("read-buoy-y", "children"),
         Output("read-sim-step", "children"),
         Output("contam-status-text", "children"),
+        Output("read-cmd-heading","children"),
+        Output("read-cmd-thrust","children"),
+        Output("read-cmd-reason","children"),
         Input("live-update-interval", "n_intervals"),
     )
     def update_readouts(_):
-        import time, datetime
-        s = buoy_dt_instance.sensor.data
 
         sensor_data = buoy_dt_instance.sensor.data
 
@@ -218,14 +247,35 @@ def register_callbacks(app, sim_state : SimulationState, buoy_dt_instance : Buoy
 
         if sim_state.contamination_detected:
             cx, cy = sim_state.contamination_local
-            contam = f"⚠ Detected at step {sim_state.sim_time}\n" \
+            contam = f"⚠ Detected on {sim_state.contamination_ts}\n" \
                      f"Local: ({cx:.1f}, {cy:.1f})\n" \
                      f"Backtrack: {'ready' if sim_state.backtrack_map is not None else 'running...'}"
         else:
             contam = "No contamination detected"
 
-        return temp, lat, lon, ph, ec, do, last, bx, by, step, contam
+        cmd = sim_state._last_cmd
+        cmd_heading = f"{np.degrees(cmd.heading_sim):.1f}" if cmd else "--"
+        cmd_thrust  = f"{cmd.thrust:.2f}"      if cmd else "--"
+        cmd_reason  = cmd.reason               if cmd else "--"
 
+        
+        return temp, lat, lon, ph, ec, do, last, bx, by, step, contam , cmd_heading, cmd_thrust , cmd_reason
+
+
+
+    @app.callback(
+        Output("btn-place-source", "style"),
+        Input("btn-place-source", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_place_source(_):
+        """Triggers the map into marker-placement mode for a new source."""
+        sim_state.setup_step = 4
+        return {"background": "transparent", "border": "1px solid #b388ff",
+                "color": "#b388ff", "fontFamily": "monospace", "fontSize": "11px",
+                "letterSpacing": "0.08em", "padding": "6px 12px", "cursor": "pointer",
+                "borderRadius": "3px", "width": "100%", "marginBottom": "6px"}
+    
     # ---- Start / Pause / Reset ----
 
     @app.callback(
@@ -292,6 +342,7 @@ def register_callbacks(app, sim_state : SimulationState, buoy_dt_instance : Buoy
 
     @app.callback(
         Output("btn-reset-all", "style"),
+        Output("river-centerline-overlay", "positions", allow_duplicate=True),
         Input("btn-reset-all", "n_clicks"),
         prevent_initial_call=True,
     )
@@ -309,15 +360,90 @@ def register_callbacks(app, sim_state : SimulationState, buoy_dt_instance : Buoy
 
         buoy_dt_instance.hard_reset()
 
-        return {"background": "transparent", "border": "1px solid #ff1744",
+        return ({"background": "transparent", "border": "1px solid #ff1744",
                 "color": "#ff1744", "fontFamily": "monospace", "fontSize": "11px",
                 "letterSpacing": "0.08em", "padding": "6px 12px", "cursor": "pointer",
-                "borderRadius": "3px", "width": "100%", "marginBottom": "6px"}
+                "borderRadius": "3px", "width": "100%", "marginBottom": "6px"} , [])
 
     @app.callback(
         Output("mode-selector", "value"),
         Input("mode-selector", "value"),
     )
     def on_mode_change(mode):
-        sim_state.mode = mode
+        new_mode = BuoyMode(mode)
+        sim_state.mode = new_mode
+        sim_state.buoy_dt.set_mode(new_mode)   
         return mode
+
+
+    # ── Save river ─────────────────────────────────────────────────────
+    @app.callback(
+        Output("notification-bar", "children", allow_duplicate=True),
+        Output("notification-bar", "style",    allow_duplicate=True),
+        Input("btn-save-river", "n_clicks"),
+        State("river-name-input", "value"),
+        prevent_initial_call=True,
+    )
+    def on_save_river(_, name):
+        if not sim_state.georef._is_set or not sim_state.georef.gps_points:
+            return ("No river drawn yet — draw the centreline first",
+                    {"marginTop":"auto","padding":"6px 8px","borderRadius":"2px","fontFamily":"monospace",
+                     "fontSize":"9px","display":"block","background":"#301010",
+                     "border":"1px solid #ff174440","color":"#ff9800"})
+        cfg = RiverConfig(
+            name=name or "unnamed_river",
+            width_m=sim_state.river_width or 80.0,
+            gps_polyline=sim_state.georef.gps_points,
+            source="drawn",
+        )
+        path = save_config(cfg)
+        return (f"Saved: {cfg.name}",
+                {"marginTop":"auto","padding":"6px 8px","borderRadius":"2px","fontFamily":"monospace",
+                 "fontSize":"9px","display":"block","background":"#0d3020",
+                 "border":"1px solid #69f0ae40","color":"#69f0ae"})
+    
+
+    # ── Populate load dropdown ─────────────────────────────────────────
+    @app.callback(
+        Output("river-load-dropdown", "options"),
+        Input("live-update-interval", "n_intervals"),
+    )
+    def refresh_presets(_):
+        saved = list_saved()
+        return [{"label": f"{s['label']}  ({s['n_pts']} pts, {s['width_m']:.0f}m)",
+                 "value": s["value"]} for s in saved]
+
+    # ── Load selected river ────────────────────────────────────────────
+    @app.callback(
+        Output("notification-bar", "children", allow_duplicate=True),
+        Output("notification-bar", "style",    allow_duplicate=True),
+        Output("river-centerline-overlay", "positions", allow_duplicate=True),
+        Input("btn-load-river", "n_clicks"),
+        State("river-load-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def on_load_river(_, path):
+        if not path:
+            return "Select a profile from the dropdown first", no_update, no_update
+        try:
+            cfg = load_config(path)
+            sim_state.river_width = cfg.width_m
+            sim_state.georef.set_gps_polyline(cfg.gps_polyline)
+            sim_state.build_river()
+            sim_state.setup_step = 2
+            
+            overlay_positions = sim_state.get_river_overlay_gps()
+
+            return (f"Loaded: {cfg.name}",
+                    {"marginTop":"auto","padding":"6px 8px","borderRadius":"2px","fontFamily":"monospace",
+                     "fontSize":"9px","display":"block","background":"#0d3020",
+                     "border":"1px solid #69f0ae40","color":"#69f0ae"}, 
+                     overlay_positions
+                    )
+        except Exception as e:
+            return (f"Load error: {e}",
+                    {"marginTop":"auto","padding":"6px 8px","borderRadius":"2px","fontFamily":"monospace",
+                     "fontSize":"9px","display":"block","background":"#301010",
+                     "border":"1px solid #ff174440","color":"#ff9800"},
+                     no_update
+                     )

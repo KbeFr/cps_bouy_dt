@@ -1,7 +1,9 @@
+from types import NoneType
+
 import numpy as np
 
 from core.buoy_dt.buoy_controller import MissionCommand
-from core.river_model import River
+from core.river_model.river_model import River
 
 import config
 
@@ -222,8 +224,10 @@ class BuoyEKF5:
     def position(self, value: tuple[float, float]):
         if len(value) != 2:
             raise ValueError("Position must be a tuple of (x, y)")
-        
-        self.x = [float(value[0]), float(value[1])]
+                
+        if self.x is None:
+            self.x = np.zeros(5)
+        self.x[0], self.x[1] = float(value[0]), float(value[1])
 
     @property
     def velocity_sim(self) -> tuple[float, float]:
@@ -256,11 +260,11 @@ class BuoyParticle:
     enforcer still applies so the sim buoy cannot exit the channel.
     """
 
-    def __init__(self, river: River, x0: float, y0: float):
+    def __init__(self, river: River, x0: float | NoneType, y0: float | NoneType):
         self.river = river
         self.D_T = config.DEFAULT_D_T_BUOY
-        self.x = float(x0)
-        self.y = float(y0)
+        self.x = x0
+        self.y = y0
         self.theta = 0.0
 
         self._mission: MissionCommand | None = None
@@ -274,11 +278,11 @@ class BuoyParticle:
     def update_sim(self, dt: float):
         """
         Passive flow + optional active heading thrust.
-
-        Active thrust is added in the commanded direction and scaled by
-        cmd.thrust.  River flow still dominates — the boat is not fast
-        enough to fight the current, it can only steer within it.
         """
+
+        if self.x is None or self.y is None:
+            print("[BUOYPARTICLE] No Position set for update")
+
         pts = np.array([[self.x, self.y]])
         _, idx = self.river.physics_tree.query(pts, k=1)
         speed, angle = self.river.grid_data[int(idx[0])]
@@ -292,13 +296,21 @@ class BuoyParticle:
         dx += noise * (-np.sin(angle))
         dy += noise * (np.cos(angle))
 
+        print("BOUY")
+        print(self._mission)
         # Active steering contribution
         if self._mission is not None and self._mission.reason != "stop":
+            
             boat_speed = speed * 0.6 * self._mission.thrust  # boat ~ 60% of river speed
-            θ_cmd = self._mission.heading_sim
-            dx += boat_speed * dt * np.cos(θ_cmd)
-            dy += boat_speed * dt * np.sin(θ_cmd)
-            self.theta = θ_cmd
+            
+            print(boat_speed)
+            
+            angle_cmd = self._mission.heading_sim
+            
+            print(angle_cmd)
+            dx += boat_speed * dt * np.cos(angle_cmd)
+            dy += boat_speed * dt * np.sin(angle_cmd)
+            self.theta = angle_cmd
 
         self.x += dx
         self.y += dy

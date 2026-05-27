@@ -7,7 +7,7 @@ class GPSData:
     lat: float
     lon: float
     vn: float
-    vs: float
+    ve: float
 
 
 @dataclass
@@ -27,6 +27,7 @@ class IMUData:
 @dataclass
 class BuoySensorData:
     temperature: Optional[float] = None
+    counter: Optional[int] = None
     ph: Optional[float] = None
     ec: Optional[float] = None
     do: Optional[float] = None
@@ -75,6 +76,10 @@ class BuoySensor:
         if "temp" in data:
             self.data.temperature = data.get("temp")
 
+        # --- Counter ---
+        if "counter" in data:
+            self.data.counter = int(data.get("counter"))
+
         # --- Water Quality Sensors ---
         if "ph" in data:
             self.data.ph = data.get("ph")
@@ -89,10 +94,10 @@ class BuoySensor:
         if "gps" in data and isinstance(data["gps"], dict):
             gps_data = data.get("gps", {})
             self.data.gps = GPSData(
-                lat=gps_data.get("latitude", 0.0),
-                lon=gps_data.get("longitude", 0.0),
-                vn=gps_data.get("speed_north", 0.0),
-                vs=gps_data.get("speed_east", 0.0)
+                lat=float(gps_data.get("lat", 0.0)),
+                lon= float(gps_data.get("lon", 0.0)),
+                vn= float(gps_data.get("speed_n", 0.0)),
+                ve= float(gps_data.get("speed_e", 0.0))
             )
 
         # --- IMU Batch ---
@@ -107,16 +112,16 @@ class BuoySensor:
 
                 parsed_imu_batch.append(
                     IMUData(
-                        dt=imu_raw.get("dt", 0.0),
-                        ax=imu_raw.get("ax", 0.0),
-                        ay=imu_raw.get("ay", 0.0),
-                        az=imu_raw.get("az", 0.0),
-                        gx=imu_raw.get("gx", 0.0),
-                        gy=imu_raw.get("gy", 0.0),
-                        gz=imu_raw.get("gz", 0.0),
-                        mx=imu_raw.get("mx", 0.0),
-                        my=imu_raw.get("my", 0.0),
-                        mz=imu_raw.get("mz", 0.0)
+                        dt= float(imu_raw.get("dt", 0.0)),
+                        ax= float(imu_raw.get("ax", 0.0)),
+                        ay= float(imu_raw.get("ay", 0.0)),
+                        az= float(imu_raw.get("az", 0.0)),
+                        gx= float(imu_raw.get("gx", 0.0)),
+                        gy= float(imu_raw.get("gy", 0.0)),
+                        gz= float(imu_raw.get("gz", 0.0)),
+                        mx= float(imu_raw.get("mx", 0.0)),
+                        my= float(imu_raw.get("my", 0.0)),
+                        mz= float(imu_raw.get("mz", 0.0))
                     )
                 )
 

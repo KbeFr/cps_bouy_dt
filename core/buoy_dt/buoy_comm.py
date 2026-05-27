@@ -4,10 +4,10 @@
 
 import requests
 import time
+import json
 import threading
 from typing import Callable
 import config
-from dataclasses import dataclass
 
 
 
@@ -88,17 +88,42 @@ class BuoyComm:
                 headers=self._headers,
                 params={"keys": ",".join(keys)},
                 timeout=10,
-            )
+            ) 
             if resp.status_code == 200:
                 raw = resp.json()
-                # Flatten: {"temperature": [{"ts":..., "value":"29.6"}]} -> {"temperature": 29.6}
                 flat = {}
                 for k, v_list in raw.items():
-                    if v_list:
+                    if not v_list:
+                        continue
+                        
+                    raw_val = v_list[0]["value"]
+                    
+                    # Try to parse stringified JSON (handles dicts and lists)
+                    if isinstance(raw_val, str):
                         try:
-                            flat[k] = float(v_list[0]["value"])
-                        except (ValueError, TypeError):
-                            flat[k] = v_list[0]["value"]
+                            # This converts '{"lat":...}' into an actual dict
+                            parsed_val = json.loads(raw_val)
+                            
+                            # json.loads can also return numbers if it parses "60"
+                            if isinstance(parsed_val, (dict, list)):
+                                flat[k] = parsed_val
+                                continue
+                        except json.JSONDecodeError:
+                            pass # Not a valid JSON string, fall through to next checks
+                    
+                    # Try converting to float (for things like "29.6")
+                    try:
+                        flat[k] = float(raw_val)
+                    except (ValueError, TypeError):
+                        # Fallback: leave it as a normal string
+                        flat[k] = raw_val
+
+#Expecting something like this. 
+#{gps:{lat:3.112,lon:12.55,speed_n:1,speed_s:2},
+#imu:[{"dt":10,"ax":1,"ay":2,"az":3,"gx":4,"gy":5,"gz":6,"mx":7,"my":8,"mz":9},{"dt":20,"ax":1,"ay":2,"az":3,"gx":4,"gy":5,"gz":6,"mx":7,"my":8,"mz":9},{"dt":30,"ax":1,"ay":2,"az":3,"gx":4,"gy":5,"gz":6,"mx":7,"my":8,"mz":9}],
+# temp:60,
+# counter:55}"
+                print(flat)
                 self.latest = flat
                 self.last_update = time.time()
                 return flat

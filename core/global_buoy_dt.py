@@ -1,4 +1,4 @@
-from enum import auto, Enum
+from enum import Enum
 
 import numpy as np
 
@@ -7,7 +7,7 @@ from core.buoy_dt.buoy_comm import BuoyComm
 from core.buoy_dt.buoy_models import BuoyParticle, BuoyEKF5
 from core.buoy_dt.buoy_sensor import BuoySensor
 from core.georef import GeoReference
-from core.river_model import River
+from core.river_model.river_model import River
 
 
 # =============================================================================
@@ -60,20 +60,30 @@ class BuoyDigitalTwin():
             self.model_used.update_sim(self.dt)
 
         elif self.mode == BuoyMode.REAL:
-            # Should be initialized, but we dont know if the data we get is already updated, check this first
-            if self.last_time_real_used >= self.comm_dt.last_update:
+            # predict : consume IMU batch first (regardless of GPS)
+            imu_batch = self.sensor.data.imu or []
+            self.sensor.data.imu = []          # consume so it doesn't replay
+            for sample in imu_batch:
+                self.model_used.propagate_imu(
+                    ax=sample.ax, ay=sample.ay, gz=sample.gz, dt=sample.dt
+                )
 
-                print("Real data used in previous updated, dead reckoning")
+            # correct: only if we have fresh GPS
+            if self.last_time_real_used < self.comm_dt.last_update:
+                result = self.get_local_gps_from_sensor()
+                if result is not None:
+                    x_sim, y_sim, vx_sim, vy_sim = result
+                    self.model_used.update_gps(x_sim, y_sim, vx_sim, vy_sim)
+                    self.last_time_real_used = self.comm_dt.last_update
 
-                # before calling dead reckoning
-                pts = np.array([[self.local_x, self.local_y]])
+            # dead recon: if no IMU and no GPS 
+            elif not imu_batch:
+                pts = np.array([[self.model_used.position[0], self.model_used.position[1]]])
                 _, idx = self.river.physics_tree.query(pts, k=1)
                 speed, angle = self.river.grid_data[int(idx[0])]
-                river_vx = speed * np.cos(angle)
-                river_vy = speed * np.sin(angle)
-                # cmd_vx/vy from last mission command (store it on self) #TODO
-
-                self.model_used.propagate_dead_reckoning(river_vx, river_vy, 0.0, 0.0, self.dt)
+                self.model_used.propagate_dead_reckoning(
+                    speed * np.cos(angle), speed * np.sin(angle), 0.0, 0.0, self.dt
+                )
 
             else:
                 # Use real data gathered
@@ -118,6 +128,14 @@ class BuoyDigitalTwin():
         vx, vy = self.georef.gps_components_to_sim(gps.vn, gps.vs)
         return x, y, vx, vy
 
+    def set_start_from_gps(self , lat : float , lon : float):
+        self.update_coords_from_gps(lat, lon)
+        self.model_used.position = (self.local_x , self.local_y)
+
+    def set_start_from_local(self, x : float , y : float):
+        self.update_coords_from_local(x ,y )
+        self.model_used.position = (self.local_x , self.local_y)
+
     def update_coords_from_local(self, x: float, y: float):
         self.local_x = x
         self.local_y = y
@@ -136,27 +154,15 @@ class BuoyDigitalTwin():
             self.local_x = x
             self.local_y = y
         else:
-            print("Georef not set yet, only local coord updated")
-
-    def set_start_from_gps(self , lat : float , lon : float):
-        self.update_coords_from_gps(lat, lon)
-        self.model_used.position = (self.local_x , self.local_y)
-
-    def set_start_from_local(self, x : float , y : float):
-        self.update_coords_from_local(x ,y )
-        self.model_used.position = (self.local_x , self.local_y)
+            print("Georef not set yet, only gps coord updated")
 
     def set_mode(self, mode: BuoyMode):
         
         print(f"[BUOY] Setmode called with mode : {mode}")
 
-        self.model_used = BuoyParticle(self.river, self.local_x, self.local_y)
-
-
         if self.mode == mode:
             print("[BUOY] Mode set is same as buoy mode, nothing changes")
             return
-
 
         if mode == BuoyMode.SIM:
             print("[BUOY] Switching to Simulation")
@@ -212,6 +218,8 @@ class BuoyDigitalTwin():
 
     def set_river(self, river: River):
         self.river = river
+        if self.model_used is not None:
+            self.model_used.river = river
 
     def set_georef(self, georef: GeoReference):
         self.georef = georef
