@@ -30,7 +30,10 @@ project_bouy_dt/
 │
 ├── river_presets/              ← Saved river configurations (JSON)
 └── CPS_Buoy_Walter/
-    └── CPS_Buoy_Walter.ino     ← Arduino firmware
+|    └── CPS_Buoy_Walter.ino    ← Arduino firmware
+|
+|
+├── CPS Portfolio.zip           ← Portfolio (overview of project & architectur, final presentation)
 ```
 
 ## Setup
