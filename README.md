@@ -33,7 +33,8 @@ project_bouy_dt/
 |    └── CPS_Buoy_Walter.ino    ← Arduino firmware
 |
 |
-├── CPS Portfolio.zip           ← Portfolio (overview of project & architectur, final presentation)
+├── CPS Project Report.pdf                   ← Portfolio (overview of project & architecture)
+├── CPS_Final_Presentation_compressed.pdf    ← Final presentation (compressed)
 ```
 
 ## Setup
