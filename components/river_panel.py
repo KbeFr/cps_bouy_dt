@@ -5,17 +5,10 @@
 # The river model lives in a curvilinear grid:
 #   river.vis_x, river.vis_y  shape (N_stream, N_width) — actual XY coords
 #   concentration_map          shape (N_stream, N_width) — values at those coords
-#
-# matplotlib's pcolormesh handles irregular grids natively.
-# Plotly does NOT — go.Heatmap requires a regular grid.
-#
-# Solution: flatten vis_x/vis_y/values into scatter points and colour them.
-# go.Scattergl (WebGL) handles 100k+ points efficiently in the browser.
-# Each point gets a marker sized to roughly fill the cell (no gaps visible).
-#
+##
 # Two display modes (toggled by a radio button in the panel):
 #   "scatter"  — faithful curvilinear rendering (vis_x / vis_y coords)
-#   "logical"  — fast regular heatmap in logical (stream index, width index) space
+#   "logical"  — regular heatmap in logical (stream index, width index) space
 
 import numpy as np
 import plotly.graph_objects as go
@@ -221,8 +214,8 @@ def layout():
                     dcc.RadioItems(
                         id="river-view-mode",
                         options=[
-                            {"label": " Curvilinear (faithful)", "value": "scatter"},
-                            {"label": " Logical (fast)",          "value": "logical"},
+                            {"label": " Curvilinear", "value": "scatter"},
+                            {"label": " Logical",          "value": "logical"},
                         ],
                         value="scatter",
                         style={"color": "#ffffff", "fontSize": "11px",
@@ -267,7 +260,7 @@ def layout():
                         id="contamination-view-mode",
                         options=[
                             {"label": " Forward contamination flow", "value": "forward"},
-                            {"label": " Backtrack contamination",    "value": "backtrack"},
+                            {"label": " Probability map",    "value": "prob"},
                         ],
                         value="forward",
                         style={"color": "#ffffff", "fontSize": "11px",
@@ -288,7 +281,7 @@ def layout():
                        "minHeight": "0", "gap": "8px"},
                 children=[
                     dcc.Graph(
-                        id     = "river-backtrack-plot",
+                        id     = "river-prob-plot",
                         figure = _empty_fig("Backtrack — Source Probability"),
                         style  = {"flex": "1 1 100%", "height": "100%"},
                         config = {"displayModeBar": False, "responsive": True},
@@ -307,9 +300,9 @@ def get_graph_children(figures):
     children = []
     for i, figure in enumerate(figures):
         children.append(dcc.Graph(
-                id     = f"river-model-plot-{i}",  
+                id     = f"river-model-plot-{i}",
                 figure = figure,
-                style  = {"flex": "1"},            # 1 so they split the space evenly
+                style  = {"flex": "1", "minWidth": 0},   # minWidth:0 lets flex items shrink below content size
                 config = {"displayModeBar": False},
             ))
     return children
@@ -352,46 +345,53 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
 
         else:
             # ---- Logical heatmap  ----
-            # Here the map needs to  be visualized as 2 straight sections with the velocities displayed
-            # So a left straigt section one with v and one with v_n 
-            
-            n_stream, n_width = r.vis_v.shape
+            # n_vals = linspace(-W/2, +W/2), so j=0 is the RIGHT bank (n<0) and
+            # j=N-1 is the LEFT bank (n>0).  Without flipping, Plotly maps j=0 to
+            # the left of the x-axis — physically mirrored.  Flip the width axis
+            # so "left bank → left of plot, right bank → right of plot".
+            v_display  = r.vis_v[:,  ::-1]
+            vn_display = r.vis_vn[:, ::-1]
+            n_w = v_display.shape[1]
 
-            #Stramwise velocity 
-            fig_v = go.Figure()
-
+            # Streamwise velocity
             fig_v = go.Figure(data=go.Heatmap(
-                z=r.vis_v,
-                x=np.arange(r.vis_v.shape[0]),
-                y=np.arange(r.vis_v.shape[1]),
+                z=v_display,
+                x=np.arange(n_w),
+                y=np.arange(v_display.shape[0]),
                 colorscale="Blues",
                 colorbar=dict(title="m/s", thickness=10),
-                hovertemplate="Stream: %{x}<br>Width: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
+                hovertemplate="Cross-stream: %{x}<br>Stream: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
             ))
             fig_v.update_layout(
-                **_base_layout("Streamwise Velocity (u)"),
-                xaxis_title="Cross-stream Index",
+                **_base_layout("Streamwise Velocity (u)  —  left bank left, right bank right"),
+                xaxis_title="Cross-stream  (0 = left bank,  N = right bank)",
                 yaxis_title="Streamwise Index",
+                autosize=True,
                 uirevision="Don't change"
             )
 
             figures.append(fig_v)
 
-            #Normal direction velocity 
-            fig_vn = go.Figure()
-
+            # Normal velocity — signed: positive = toward LEFT bank, negative = toward RIGHT bank.
+            # Right bend -> outer bank is LEFT -> u_n > 0 on outer bank (red).
+            # Left  bend -> outer bank is RIGHT -> u_n < 0 on outer bank (blue).
+            vn_abs = float(np.abs(vn_display).max()) or 1.0
             fig_vn = go.Figure(data=go.Heatmap(
-                z=r.vis_vn,
-                x=np.arange(r.vis_vn.shape[0]),
-                y=np.arange(r.vis_vn.shape[1]),
-                colorscale="Blues",
+                z=vn_display,
+                x=np.arange(n_w),
+                y=np.arange(vn_display.shape[0]),
+                colorscale="RdBu",
+                zmid=0,
+                zmin=-vn_abs,
+                zmax= vn_abs,
                 colorbar=dict(title="m/s", thickness=10),
-                hovertemplate="Stream: %{x}<br>Width: %{y}<br>Speed: %{z:.2f} m/s<extra></extra>"
+                hovertemplate="Cross-stream: %{x}<br>Stream: %{y}<br>vn: %{z:.3f} m/s<extra></extra>"
             ))
             fig_vn.update_layout(
-                **_base_layout("Normal Velocity (u_n)"),
-                xaxis_title="Cross-stream Index",
+                **_base_layout("Normal Velocity (u_n)  —  red=toward left bank  /  blue=toward right bank"),
+                xaxis_title="Cross-stream  (0 = left bank,  N = right bank)",
                 yaxis_title="Streamwise Index",
+                autosize=True,
                 uirevision="Don't change"
             )
 
@@ -416,10 +416,10 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
                                 line=dict(color="white", width=1.5)),
                     name="True source",
                 ))
-            if sim_state.backtrack_map is not None:
+            if sim_state.probability_map is not None:
                 r = sim_state.river
-                i, j = np.unravel_index(np.argmax(sim_state.backtrack_map),
-                                        sim_state.backtrack_map.shape)
+                i, j = np.unravel_index(np.argmax(sim_state.probability_map),
+                                        sim_state.probability_map.shape)
                 fig.add_trace(go.Scattergl(
                     x=[float(r.vis_x[i, j])], y=[float(r.vis_y[i, j])],
                     mode="markers",
@@ -473,19 +473,19 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
     # ------------------------------------------------------------------
 
     @app.callback(
-        Output("river-backtrack-plot", "figure"),
+        Output("river-prob-plot", "figure"),
         Input("live-update-interval", "n_intervals"),
         Input("contamination-view-mode",      "value"),
     )
-    def update_backtrack(_, view_mode):
+    def update_probability_map(_, view_mode):
         r = sim_state.river
         if r is None:
             return _empty_fig("Draw the river on the map to start")
 
-        if view_mode == "backtrack":
-            if sim_state.backtrack_map is None:
-                return _empty_fig("No backtrack yet — awaiting contamination detection")
-            data = sim_state.backtrack_map
+        if view_mode == "prob":
+            if sim_state.probability_map is None:
+                return _empty_fig("No estimation yet — awaiting estimation")
+            data = sim_state.probability_map
             title = "Backtrack — Source Probability"
         else:
             cmap = sim_state.get_concentration_map()

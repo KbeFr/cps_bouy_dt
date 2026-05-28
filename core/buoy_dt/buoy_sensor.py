@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple , Callable
 import time
 import json
-
+import numpy as np
+import config
 
 @dataclass
 class GPSData:
@@ -85,7 +86,7 @@ def _to_dict(v) -> Optional[dict]:
     return None
 
 
-class BuoySensor:
+class BuoySensorReal:
     """
     Parses the flat telemetry dict produced by BuoyComm.get_latest() into a
     typed BuoySensorData snapshot.
@@ -179,3 +180,46 @@ class BuoySensor:
             )
             # Append as a 1-element batch so downstream EKF code can iterate
             self.data.imu = [sample]
+
+
+class BuoySensorSim:
+    def __init__(self):
+        self.data: BuoySensorData = BuoySensorData()
+        self.sim_sensor_callback: Optional[Callable[[float, float], Tuple[float, float]]] = None 
+
+    def update_sensor(self, local_x: float, local_y: float) -> BuoySensorData:
+        """
+        SIM mode: synthesize realistic pH/EC/DO sensor readings from the
+        local pollution concentration.
+        """
+        # Safety check
+        if self.sim_sensor_callback is None:
+            return self.data
+            
+        # use the callback
+        c, cmax = self.sim_sensor_callback(local_x, local_y)
+
+        # Calculate intensity
+        # Prevent division by zero if cmax happens to be 0
+        safe_cmax = cmax if cmax > 0 else 1.0 
+        raw_intensity = max(0.0, min(1.0, c / safe_cmax))
+        
+        if raw_intensity < getattr(config, "SIM_SENSOR_MIN_INTENSITY", 0.0):
+            raw_intensity = 0.0
+            
+        # Non-linear sensor dose-response
+        eff = float(raw_intensity ** 0.35) if raw_intensity > 0 else 0.0
+
+        # Apply environmental baseline and sensor noise
+        rng = np.random.default_rng()
+        self.data.ph          = 7.5 + 2.5 * eff + rng.normal(0.0, 0.05)
+        self.data.ec          = 400.0 + 900.0 * eff + rng.normal(0.0, 12.0)
+        self.data.do          = 9.0 - 5.5 * eff + rng.normal(0.0, 0.10)
+        self.data.temperature = 15.0 + 0.4 * eff + rng.normal(0.0, 0.20)
+        
+        # Stash for the buoy's own records
+        self._last_concentration = c
+        self._last_intensity = raw_intensity
+        
+        return self.data
+    

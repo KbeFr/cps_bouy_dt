@@ -2,11 +2,15 @@
 # components/control_panel.py — Left sidebar: controls + live sensor readout
 # =============================================================================
 
+import numpy as np
 from dash import html, dcc, Input, Output, State, no_update
-import config
 
 from core.global_buoy_dt import BuoyDigitalTwin, BuoyMode
 from core.simulation import SimulationState
+
+from core.river_config import (
+    RiverConfig, save_config, load_config, list_saved
+)
 
 # ------------------------------------------------------------------
 # Helpers
@@ -14,15 +18,15 @@ from core.simulation import SimulationState
 def _readout(label: str, value_id: str, unit: str = "", color: str = "#00e5ff"):
     return html.Div(
         style={"display": "flex", "justifyContent": "space-between",
-               "alignItems": "baseline", "padding": "4px 0",
-               "borderBottom": "1px solid #1e2a35"},
+               "alignItems": "baseline", "padding": "6px 0",
+               "borderBottom": "1px solid #161f28"},
         children=[
-            html.Span(label, style={"color": "#8b949e", "fontSize": "11px",
-                                    "fontFamily": "monospace", "letterSpacing": "0.05em"}),
+            html.Span(label, style={"color": "#9dafc0", "fontSize": "12px",
+                                    "fontFamily": "monospace", "letterSpacing": "0.02em"}),
             html.Span([
-                html.Span(id=value_id, style={"color": color, "fontSize": "15px",
-                                              "fontFamily": "monospace", "fontWeight": "700"}),
-                html.Span(f" {unit}", style={"color": "#8b949e", "fontSize": "10px"}),
+                html.Span(id=value_id, style={"color": color, "fontSize": "14px",
+                                              "fontFamily": "monospace", "fontWeight": "600"}),
+                html.Span(f" {unit}", style={"color": "#6b7a8d", "fontSize": "11px"}),
             ]),
         ]
     )
@@ -30,13 +34,13 @@ def _readout(label: str, value_id: str, unit: str = "", color: str = "#00e5ff"):
 
 def _section(title: str, children: list):
     return html.Div(
-        style={"marginBottom": "16px"},
+        style={"marginBottom": "20px"},
         children=[
             html.Div(title, style={
-                "color": "#8b949e", "fontSize": "10px", "fontFamily": "monospace",
-                "letterSpacing": "0.15em", "textTransform": "uppercase",
-                "borderBottom": "1px solid #1e2a35", "paddingBottom": "4px",
-                "marginBottom": "8px",
+                "color": "#6b7a8d", "fontSize": "10px", "fontFamily": "monospace",
+                "letterSpacing": "0.18em", "textTransform": "uppercase",
+                "borderBottom": "1px solid #1a2535", "paddingBottom": "5px",
+                "marginBottom": "10px",
             }),
             *children,
         ]
@@ -65,12 +69,12 @@ def _btn_style(color: str, armed: bool = False) -> dict:
         "background": color if armed else "transparent",
         "border": f"1px solid {color}",
         "color": "#0d1117" if armed else color,
-        "fontFamily": "monospace", "fontSize": "11px",
-        "letterSpacing": "0.08em", "padding": "6px 12px",
+        "fontFamily": "monospace", "fontSize": "12px",
+        "letterSpacing": "0.06em", "padding": "7px 12px",
         "cursor": "pointer", "borderRadius": "3px",
         "width": "100%", "marginBottom": "6px",
         "transition": "all 0.15s",
-        "fontWeight": "700" if armed else "400",
+        "fontWeight": "700" if armed else "500",
     }
 
 
@@ -80,25 +84,26 @@ def _btn_style(color: str, armed: bool = False) -> dict:
 def layout():
     return html.Div(
         style={
-            "width": "260px", "minWidth": "260px",
+            "width": "270px", "minWidth": "270px",
             "height": "100vh", "background": "#0d1117",
-            "borderRight": "1px solid #1e2a35",
+            "borderRight": "1px solid #161f28",
             "display": "flex", "flexDirection": "column",
-            "padding": "16px", "overflowY": "auto",
+            "padding": "20px 18px", "overflowY": "auto",
             "boxSizing": "border-box",
         },
         children=[
 
             html.Div(
-                style={"marginBottom": "20px"},
+                style={"marginBottom": "28px"},
                 children=[
-                    html.Div("BUOY", style={"color": "#00e5ff", "fontSize": "22px",
+                    html.Div("BUOY", style={"color": "#00e5ff", "fontSize": "20px",
                                             "fontFamily": "monospace", "fontWeight": "700",
                                             "letterSpacing": "0.3em"}),
-                    html.Div("DIGITAL TWIN — MEUSE", style={"color": "#8b949e",
+                    html.Div("DIGITAL TWIN — MEUSE", style={"color": "#6b7a8d",
                                                             "fontSize": "10px",
                                                             "fontFamily": "monospace",
-                                                            "letterSpacing": "0.15em"}),
+                                                            "letterSpacing": "0.18em",
+                                                            "marginTop": "3px"}),
                 ]
             ),
 
@@ -143,15 +148,53 @@ def layout():
             ]),
 
             # ---- Place source / buoy / river ----
-            _section("Map Placement", [
+            _section("River Placement", [
                 _btn("🌊 Draw RIVER centerline", "btn-place-river", "#00e5ff"),
                 _btn("📏 Draw river WIDTH",      "btn-place-width", "#00e5ff"),
                 _btn("📍 Place SOURCE on map",   "btn-place-source", "#ff1744"),
                 _btn("📍 Place BUOY START on map", "btn-place-buoy", "#69f0ae"),
                 _btn("↺ Reset river (use default)", "btn-clear-river", "#8b949e"),
+                
+                
+                
                 html.Div(id="river-info",
-                         style={"color": "#8b949e", "fontSize": "10px",
+                         style={"color": "#9dafc0", "fontSize": "11px",
                                 "fontFamily": "monospace", "marginTop": "4px"}),
+            
+            
+                            html.Div(style={"display":"flex","gap":"5px","marginBottom":"6px"}, children=[
+                    dcc.Input(id="river-name-input", type="text", placeholder="Profile name…",
+                              style={"flex":"1","background":"#0d1520","border":"1px solid #1e2a35",
+                                     "color":"#cdd9e5","fontFamily":"monospace","fontSize":"12px",
+                                     "padding":"5px 7px","borderRadius":"2px"}),
+                    html.Button("SAVE", id="btn-save-river",
+                                style={"background":"transparent","border":"1px solid #1e4a35",
+                                       "color":"#69f0ae","fontFamily":"monospace","fontSize":"11px",
+                                       "padding":"5px 8px","cursor":"pointer","borderRadius":"2px"}),
+                ]),
+                dcc.Dropdown(
+                    id="river-load-dropdown",
+                    placeholder="Load saved river...",
+                    options=[],
+                    style={
+                        "marginBottom": "6px",
+                        "background": "#0d1520",
+                        "border": "1px solid #1e2a35",
+                        "borderRadius": "2px",
+                        "color": "#cdd9e5",
+                        "fontFamily": "monospace",
+                        "fontSize": "12px",
+                    },
+                    className="dt-dropdown",
+                ),
+                html.Button("⊕  LOAD SELECTED", id="btn-load-river",
+                            style={"background":"transparent","border":"1px solid #1e3a55",
+                                   "color":"#4fc3f7","fontFamily":"monospace","fontSize":"11px",
+                                   "padding":"6px 8px","cursor":"pointer","borderRadius":"2px",
+                                   "width":"100%","marginBottom":"4px","textAlign":"left"}),
+
+            
+        
             ]),
 
             # ---- Run controls ----
@@ -165,9 +208,9 @@ def layout():
                         html.Div(
                             id="speed-label",
                             children="Speed: 1.0x  (SIM only)",
-                            style={"color": "#ffffff", "fontSize": "11px",
+                            style={"color": "#cdd9e5", "fontSize": "12px",
                                    "fontFamily": "monospace",
-                                   "letterSpacing": "0.05em", "marginBottom": "6px"},
+                                   "letterSpacing": "0.03em", "marginBottom": "6px"},
                         ),
                         dcc.Slider(
                             id="speed-slider",
@@ -188,36 +231,25 @@ def layout():
                 _btn("🗑 CLEAR LOG", "btn-clear-log", "#8b949e"),
                 _btn("✕ CLEAR DETECTION", "btn-clear-contam", "#8b949e"),
                 html.Div(id="log-status",
-                         style={"color": "#8b949e", "fontSize": "10px",
+                         style={"color": "#9dafc0", "fontSize": "11px",
                                 "fontFamily": "monospace", "marginTop": "4px"}),
+            ]),
+
+            # ---- Commands ----
+            _section("Active Command", [
+                _readout("Heading (sim)", "read-cmd-heading", "deg", "#ff9800"),
+                _readout("Thrust",        "read-cmd-thrust",  "",    "#ff9800"),
+                _readout("Reason",        "read-cmd-reason",  "",    "#8b949e"),
             ]),
 
             # ---- Contamination status ----
             _section("Contamination", [
                 html.Div(id="contam-status-text",
-                         style={"color": "#8b949e", "fontSize": "11px",
+                         style={"color": "#9dafc0", "fontSize": "12px",
                                 "fontFamily": "monospace",
                                 "whiteSpace": "pre-wrap"}),
             ]),
 
-            html.Div(
-                style={"marginTop": "auto", "paddingTop": "16px",
-                       "borderTop": "1px solid #1e2a35"},
-                children=[
-                    html.Div("WORKFLOW", style={"color": "#8b949e", "fontSize": "9px",
-                                                "fontFamily": "monospace",
-                                                "letterSpacing": "0.15em",
-                                                "marginBottom": "6px"}),
-                    html.Ol([
-                        html.Li("Place SOURCE (sim) and BUOY START on map"),
-                        html.Li("Press START"),
-                        html.Li("After the buoy drifts through plume → press ESTIMATE SOURCE"),
-                        html.Li("Run again from a new buoy start to sharpen the estimate"),
-                    ], style={"color": "#8b949e", "fontSize": "10px",
-                              "fontFamily": "monospace", "paddingLeft": "16px",
-                              "lineHeight": "1.6"}),
-                ]
-            ),
         ]
     )
 
@@ -241,11 +273,14 @@ def register_callbacks(app, sim_state: SimulationState, buoy_dt_instance: BuoyDi
         Output("read-sim-step", "children"),
         Output("contam-status-text", "children"),
         Output("log-status", "children"),
+        Output("read-cmd-heading","children"),
+        Output("read-cmd-thrust","children"),
+        Output("read-cmd-reason","children"),
         Input("live-update-interval", "n_intervals"),
     )
     def update_readouts(_):
         import datetime
-        s = buoy_dt_instance.sensor.data
+        s = buoy_dt_instance.sensor_real.data
 
         temp = s.formatted_temp
         lat  = s.formatted_lat
@@ -271,11 +306,16 @@ def register_callbacks(app, sim_state: SimulationState, buoy_dt_instance: BuoyDi
             contam = "No contamination detected"
 
         log = f"log: {len(sim_state.measurement_log)} samples"
-        if sim_state.backtrack_map is not None:
-            log += " | backtrack: ready"
+        if sim_state.probability_map is not None:
+            log += " | prob: ready"
+
+        cmd = sim_state._last_cmd
+        cmd_heading = f"{np.degrees(cmd.heading_sim):.1f}" if cmd else "--"
+        cmd_thrust  = f"{cmd.thrust:.2f}"      if cmd else "--"
+        cmd_reason  = cmd.reason               if cmd else "--"
 
         return (temp, lat, lon, ph, ec, do_, last,
-                bx, by, step, contam, log)
+                bx, by, step, contam, log, cmd_heading , cmd_thrust , cmd_reason)
 
     # ---- Mode selector — actually swap the model ----
     @app.callback(
@@ -437,3 +477,73 @@ def register_callbacks(app, sim_state: SimulationState, buoy_dt_instance: BuoyDi
     def on_clear_contam(n):
         sim_state.reset_contamination()
         return n
+    
+
+    
+    # ── Save river ─────────────────────────────────────────────────────
+    @app.callback(
+        Input("btn-save-river", "n_clicks"),
+        State("river-name-input", "value"),
+        prevent_initial_call=True,
+    )
+    def on_save_river(_, name):
+        if not sim_state.georef._is_set or not sim_state.georef.gps_points:
+            return 
+        
+        cfg = RiverConfig(
+            name=name or "unnamed_river",
+            width_m=sim_state.river_width or 80.0,
+            gps_polyline=sim_state.georef.gps_points,
+            source="drawn",
+            # Add a copy of the measurement log to the config
+            measurement_log=list(sim_state.measurement_log)
+        )
+        path = save_config(cfg)
+        return
+    
+
+    # ── Populate load dropdown ─────────────────────────────────────────
+    @app.callback(
+        Output("river-load-dropdown", "options"),
+        Input("live-update-interval", "n_intervals"),
+    )
+    def refresh_presets(_):
+        saved = list_saved()
+        return [{"label": f"{s['label']}  ({s['n_pts']} pts, {s['width_m']:.0f}m)",
+                 "value": s["value"]} for s in saved]
+
+    # ── Load selected river ────────────────────────────────────────────
+    @app.callback(
+        Output("river-centerline-overlay", "positions", allow_duplicate=True),
+        Input("btn-load-river", "n_clicks"),
+        State("river-load-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def on_load_river(_, path):
+        if not path:
+            return no_update
+            
+        try:
+            cfg = load_config(path)
+            
+            from core.river_config import save_autosave
+            save_autosave(points=cfg.gps_polyline, width_m=cfg.width_m)
+            
+            sim_state.running = False
+            sim_state.reset_contamination()
+            sim_state.buoy_dt.buoy_history_gps.clear()
+            
+            # Restore the saved measurement log (default to empty list if missing)
+            sim_state.measurement_log = getattr(cfg, "measurement_log", []).copy()
+            
+            sim_state.build_river()
+            
+            if hasattr(sim_state, "setup_step"):
+                sim_state.setup_step = 2
+            
+            overlay_positions = sim_state.get_river_overlay_gps()
+
+            return overlay_positions
+        except Exception as e:
+            print(f"Error loading river: {e}")
+            return no_update

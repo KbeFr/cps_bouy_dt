@@ -1,10 +1,11 @@
 from enum import Enum
+from typing import Callable
 import numpy as np
 
 import config
 from core.buoy_dt.buoy_comm import BuoyComm
 from core.buoy_dt.buoy_models import BuoyParticle, BuoyEKF5
-from core.buoy_dt.buoy_sensor import BuoySensor
+from core.buoy_dt.buoy_sensor import  BuoySensorData, BuoySensorReal , BuoySensorSim
 from core.georef import GeoReference
 from core.river_model import River
 
@@ -36,12 +37,15 @@ class BuoyDigitalTwin:
         self.dt = 1.0   # set per-tick by SimulationState (real-time)
 
         # -------- Sensors --------
-        self.sensor: BuoySensor = BuoySensor()
+        self.sensor_real: BuoySensorReal = BuoySensorReal()
+        self.sensor_sim : BuoySensorSim = BuoySensorSim()
+
+        self.sensor_data : BuoySensorData = BuoySensorData()
 
         # -------- Communication (ThingsBoard) --------
         self.comm_dt = BuoyComm()
         self.comm_dt.login()
-        self.comm_dt.start_polling(callback=self.sensor.update_sensor)
+        self.comm_dt.start_polling(callback=self.sensor_real.update_sensor)
 
     # ------------------------------------------------------------------
     def step(self):
@@ -49,13 +53,15 @@ class BuoyDigitalTwin:
             return
 
         if self.mode == BuoyMode.SIM or self.mode == BuoyMode.HIL:
+            #update the model used
             self.model_used.update_sim(self.dt)
-
+            #update the sensor used 
+            self.sensor_data = self.sensor_sim.update_sensor(self.local_x, self.local_y)
         elif self.mode == BuoyMode.REAL:
             if not isinstance(self.model_used, BuoyEKF5):
                 if not self._init_real_model_from_latest_sample():
                     return
-
+                self.sensor_data = self.sensor_real.data
             if self.last_time_real_used >= self.comm_dt.last_update:
                 # No new data — dead-reckon with river flow
                 if self.local_x is None or self.local_y is None or self.river is None:
@@ -125,6 +131,9 @@ class BuoyDigitalTwin:
         if self.model_used is not None:
             self.model_used.position = (self.local_x, self.local_y)
 
+    def set_sim_sensor(self, callback: Callable[[float, float], tuple[float, float]]):
+        self.sensor_sim.sim_sensor_callback = callback
+
     # ------------------------------------------------------------------
     def _init_real_model_from_latest_sample(self) -> bool:
         """Create the EKF once the first live GPS sample is available."""
@@ -178,6 +187,8 @@ class BuoyDigitalTwin:
                 return
 
         self.mode = mode
+
+
 
     # ------------------------------------------------------------------
     def hard_reset(self):

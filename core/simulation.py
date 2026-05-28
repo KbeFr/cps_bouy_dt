@@ -2,24 +2,22 @@
 # core/simulation.py — Simulation state manager
 # =============================================================================
 
-import json
 import os
-
 import numpy as np
 import time
-
 import config
+from core.buoy_dt.buoy_controller import BuoyController
+from core.georef import GeoReference
+from core.river_model import River, DVsolver
+from core.global_buoy_dt import BuoyDigitalTwin, BuoyMode
+from core.estimator import Estimator
+from core.river_config import load_autosave, save_autosave, PRESETS_DIR
 
 # Persisted user-drawn centerline lives here so it survives restarts.
 CENTERLINE_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data", "centerline.json"
 )
-from core.buoy_dt.buoy_controller import BuoyController
-from core.georef import GeoReference
-from core.river_model import River, DVsolver
-from core.global_buoy_dt import BuoyDigitalTwin, BuoyMode
-
 
 class SimulationState:
     """
@@ -47,6 +45,8 @@ class SimulationState:
 
     def __init__(self, buoy_dt: BuoyDigitalTwin):
         self.buoy_dt: BuoyDigitalTwin = buoy_dt
+        self.buoy_dt.set_sim_sensor(self.get_concentration_data)
+
         self.controller = None
         self._last_cmd = None
 
@@ -76,9 +76,9 @@ class SimulationState:
         self.contamination_ts = 0.0
         self.contamination_local = (0.0, 0.0)
         self.contamination_gps = (config.MAP_DEFAULT_LAT, config.MAP_DEFAULT_LON)
-        self.backtrack_map = None             # 2-D heatmap (N_stream, N_width)
-        self.backtracking = False             # True while estimator is running
-
+        self.probability_map = None             # 2-D heatmap (N_stream, N_width)
+        self.estimating = False             # True while estimator is running
+        self.estimator = None
         # Detection history — every DETECTION_SAMPLE_S seconds while detected,
         # we snapshot (t, x_local, y_local, lat, lon, intensity) so the river
         # plot can show the full track of contamination encounters.
@@ -86,7 +86,7 @@ class SimulationState:
         self._last_detection_sample_t: float = -1e9
         self.DETECTION_SAMPLE_S = 15.0   # seconds between detection-history samples
 
-        # --- Measurement log (for batch backtracking) ---
+        # --- Measurement log (for batch estimating) ---
         # Each entry: dict(t, lat, lon, x_local, y_local, ph, ec, do, severity)
         self.measurement_log: list[dict] = []
 
@@ -103,49 +103,52 @@ class SimulationState:
         self._toast_color: str = "#69f0ae"
         self._toast_until_ts: float = 0.0
 
-        # --- Preload the abstract Meuse river ---
         self.build_river()
-
+ 
     # ------------------------------------------------------------------
     # River setup
     # ------------------------------------------------------------------
     def build_river(self):
         """
         Build the river. If a user-drawn centerline has been persisted, use
-        that; otherwise fall back to the abstract Meuse topology in config.
+        that, otherwise fall back to the abstract Meuse topology in config.
         """
-        ds = config.DEFAULT_DS_L
-        gps_polyline, saved_width = self._load_river_state()
+        gps_polyline, saved_width = load_autosave()
         if saved_width is not None and saved_width > 0:
             self.river_width = saved_width
 
         if gps_polyline is not None and len(gps_polyline) >= 2:
             # Use the drawn polyline → derive topology via georef
-            self.georef = GeoReference()
             self.georef.set_gps_polyline(gps_polyline)
             topo = self.georef.to_river_topology(
-                bend_radius=60.0,
-                merge_window_m=config.DEFAULT_MERGE_WINDOW_M if hasattr(config, "DEFAULT_MERGE_WINDOW_M") else 50.0,
+                bend_radius=config.DEFAULT_BEND_RADIUS if hasattr(config, "DEFAULT_BEND_RADIUS") else 60.0,
+                merge_window_m=config.DEFAULT_MERGE_WINDOW_M if hasattr(config, "DEFAULT_MERGE_WINDOW_M") else 100.0,
             )
-            self.georef.build_discretized_tree(topo, ds)
+
+            ds_length = self.calculate_ds(topo)            
+
+            self.georef.build_discretized_tree(topo, ds_length)
             print(f"[Simulation] Loaded drawn centerline ({len(gps_polyline)} GPS pts -> {len(topo)} segments)")
         else:
             # Abstract fallback
             topo = config.MEUSE_TOPOLOGY
+
+            ds_length = self.calculate_ds(topo)
+
             heading_rad = np.deg2rad(30.0)
             self.georef.preload_from_origin(
                 origin_lat=config.MEUSE_CENTER_LAT,
                 origin_lon=config.MEUSE_CENTER_LON,
                 heading_rad=heading_rad,
                 topology=topo,
-                ds_length=ds,
+                ds_length=ds_length,
             )
             print("[Simulation] Using abstract Meuse topology (no drawn centerline yet)")
 
         self.river = River(
             topology=topo,
             width=self.river_width,
-            ds_length=ds,
+            ds_length=ds_length,
             n_width=config.DEFAULT_N_WIDTH,
             u_avg=config.DEFAULT_U_AVG,
             alpha_secondary=config.DEFAULT_ALPHA_SEC,
@@ -173,12 +176,19 @@ class SimulationState:
 
         self.buoy_dt.set_mode(self.mode)
         self.controller = BuoyController(
-            river=self.river,
-            river_heading=self.georef.heading,
-        )
+        river=self.river,
+        river_heading=self.georef.heading,
+        avoid_threshold=0.72,   # steer back when within 28 % of bank
+        sweep_angle=np.deg2rad(25),
+        sweep_period=55.0,      # seconds per sweep leg (tune to your river length)
+        enable_sweep=False,
+        )    
+        self.estimator = Estimator(river=self.river, georef=self.georef)
 
         print(f"[Simulation] River preloaded — {len(self.river.xc)} centreline points, "
               f"width={self.river_width:.1f}m")
+
+
 
     def _rebuild_dv(self):
         """
@@ -220,45 +230,15 @@ class SimulationState:
         return float(cx + vx / norm * limit), float(cy + vy / norm * limit)
 
     # ------------------------------------------------------------------
-    # Persisted centerline (load / save)
+    # Drawing set
     # ------------------------------------------------------------------
-    def _load_river_state(self) -> tuple[list[tuple] | None, float | None]:
-        """Return (centerline_pts, width_m) from the saved file, or (None, None)."""
-        try:
-            with open(CENTERLINE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            pts = [tuple(p) for p in data.get("points", []) if len(p) == 2]
-            pts = pts if len(pts) >= 2 else None
-            width = data.get("width_m")
-            return pts, (float(width) if width else None)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return None, None
-
-    def _save_river_state(self,
-                          points: list[tuple] | None = None,
-                          width_m: float | None = None):
-        """Merge update: keep whichever of points/width isn't being changed."""
-        existing_pts, existing_w = self._load_river_state()
-        out_pts   = points  if points  is not None else existing_pts
-        out_width = width_m if width_m is not None else existing_w
-        os.makedirs(os.path.dirname(CENTERLINE_FILE), exist_ok=True)
-        payload = {}
-        if out_pts is not None:
-            payload["points"] = [list(p) for p in out_pts]
-        if out_width is not None:
-            payload["width_m"] = float(out_width)
-        with open(CENTERLINE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        print(f"[Simulation] River state saved -> {CENTERLINE_FILE} "
-              f"(pts={len(out_pts) if out_pts else 0}, width="
-              f"{out_width if out_width else 'default'})")
 
     def set_drawn_centerline(self, gps_points: list[tuple]):
         """Persist a user-drawn GPS centerline and rebuild the river from it."""
         if len(gps_points) < 2:
             print("[Simulation] Need at least 2 points to define a centerline")
             return
-        self._save_river_state(points=gps_points)
+        save_autosave(points=gps_points)
         # Rebuild river from scratch (loads the just-saved file)
         self.running = False
         self.reset_contamination()
@@ -282,7 +262,7 @@ class SimulationState:
             self.set_toast("Drawn width is too small, try a longer line.", "#ff9800")
             return
         self.river_width = width
-        self._save_river_state(width_m=width)
+        save_autosave(width_m=width)
         self.running = False
         self.reset_contamination()
         self.measurement_log.clear()
@@ -293,17 +273,20 @@ class SimulationState:
 
     def clear_drawn_centerline(self):
         """Revert to the abstract Meuse fallback by deleting the saved file."""
+        autosave_path = os.path.join(PRESETS_DIR, "autosave.json")
         try:
-            os.remove(CENTERLINE_FILE)
+            os.remove(autosave_path)
             print(f"[Simulation] Centerline cleared")
         except FileNotFoundError:
             pass
+            
         self.running = False
         self.river_width = config.MEUSE_WIDTH_M
         self.reset_contamination()
         self.measurement_log.clear()
         self.buoy_dt.buoy_history_gps.clear()
         self.build_river()
+
 
     # ------------------------------------------------------------------
     # User placement (called by map_panel callbacks)
@@ -374,122 +357,31 @@ class SimulationState:
 
         # Apply the speed multiplier in SIM mode only; REAL mode stays 1:1.
         speed = self.speed_multiplier if self.mode == BuoyMode.SIM else 1.0
-        # Cap per-tick sim-time. With 50x speed and a 0.5s wall tick that's
-        # 25 s of sim-time per call; we allow up to 30 s before clamping so
-        # the slider actually delivers its requested speed.
         dt = min(30.0, wall_dt * speed)
 
         self.sim_time += dt
 
-        # Forward plume evolution (visualization only)
+        # Forward plume evolution
         self.dv.update()
 
         # Advance the buoy
         self.buoy_dt.dt = dt
         self.buoy_dt.step()
 
-        # SIM mode: synthesize sensor readings from the local concentration
-        if self.mode == BuoyMode.SIM:
-            self._synthesize_sim_sensors()
-
+        # Check contrller for commands
+        if self.controller is not None and self.buoy_dt.model_used is not None:
+            x = self.buoy_dt.local_x
+            y = self.buoy_dt.local_y
+    
+            cmd = self.controller.compute_command(x_sim=x, y_sim=y, dt=dt)
+            self._last_cmd = cmd
+    
+            if hasattr(self.buoy_dt.model_used, "set_mission"):
+                self.buoy_dt.model_used.set_mission(cmd)
+    
         # Log + check alarm rules
         self._log_and_check()
 
-    # ------------------------------------------------------------------
-    # SIM mode synthetic sensors
-    # ------------------------------------------------------------------
-    def _synthesize_sim_sensors(self):
-        """
-        SIM mode: synthesize realistic pH/EC/DO sensor readings from the
-        local pollution concentration.
-
-        Modeled as an ALKALINE industrial discharge (typical of paper/textile
-        effluents):
-          * pH rises (alkaline)  — neutral 7.5 -> up to ~9.8 in strong plume
-          * EC rises             — clean ~400 µS/cm -> up to ~1300 in plume
-          * DO drops             — saturated 9 mg/L -> down to ~3.5 in plume
-        Each follows the local concentration intensity (0..1) plus small
-        sensor noise. With this profile, the configured ThingsBoard-style
-        alarm rules fire clearly inside the plume.
-        """
-        if self.dv is None:
-            return
-        cmap = self.dv.get_concentration_map()
-        try:
-            pts = np.array([[self.buoy_dt.local_x, self.buoy_dt.local_y]])
-            _, idx = self.river.physics_tree.query(pts, k=1)
-            idx = int(idx[0])
-            n_width = self.river.n_width
-            i = idx // n_width
-            j = idx %  n_width
-            c = float(cmap[i, j])
-        except Exception:
-            c = 0.0
-
-        cmax = float(cmap.max() or 1.0)
-        raw_intensity = max(0.0, min(1.0, c / cmax))
-        if raw_intensity < getattr(config, "SIM_SENSOR_MIN_INTENSITY", 0.0):
-            raw_intensity = 0.0
-        # Non-linear sensor dose-response.  Real ion-selective probes and
-        # spectrophotometric sensors saturate quickly: even low-concentration
-        # contamination produces large reading shifts because the threshold
-        # values are well above the natural baseline noise.  Power 0.35 puts
-        # 10% local intensity at ~46% of full deflection — matches the
-        # ~order-of-magnitude sensitivity of real EC / DO / pH probes near
-        # their environmental detection limits.
-        eff = float(raw_intensity ** 0.35) if raw_intensity > 0 else 0.0
-
-        rng = np.random.default_rng()
-        n_ph   = rng.normal(0.0, 0.05)
-        n_ec   = rng.normal(0.0, 12.0)
-        n_do   = rng.normal(0.0, 0.10)
-        n_temp = rng.normal(0.0, 0.20)
-
-        # All three sensors deviate inside the plume so alarm rules fire.
-        self.buoy_dt.sensor.data.ph          = 7.5 + 2.5 * eff + n_ph     # baseline 7.5 -> 10.0 (>9 = crit)
-        self.buoy_dt.sensor.data.ec          = 400.0 + 900.0 * eff + n_ec # 400 -> 1300 (>1000 = crit)
-        self.buoy_dt.sensor.data.do          = 9.0 - 5.5 * eff + n_do     # 9 -> 3.5 (<5 = crit)
-        self.buoy_dt.sensor.data.temperature = 15.0 + 0.4 * eff + n_temp
-        # Stash for callers (logger, history)
-        self._last_concentration = c
-        self._last_intensity = raw_intensity
-
-    # ------------------------------------------------------------------
-    # Pollution score (used by estimator as the observed concentration)
-    # ------------------------------------------------------------------
-    @staticmethod
-    def pollution_score(ph: float | None, ec: float | None, do: float | None) -> float:
-        """
-        Map raw pH/EC/DO readings to a single [0, 1] "pollution-likeness" score.
-
-        Each sensor contributes a per-channel score in [0, 1] based on how far
-        it has deviated from its clean-water baseline toward the configured
-        critical alarm threshold:
-
-          pH deviation toward 9.0 (alkaline) or 6.0 (acidic):   [0, 1]
-          EC rising from 400 toward 1000 µS/cm:                 [0, 1]
-          DO falling from 9.0 toward 5.0 mg/L:                  [0, 1]
-
-        The overall score is the MEAN over contributing sensors — this
-        averages out single-sensor noise while still rewarding consensus
-        between channels. Returns 0.0 when no readings are available.
-
-        This is the value the Bayesian estimator treats as the "observed
-        concentration" c_obs in its likelihood — it works equally well in
-        SIM mode (where the readings are synthesised) and REAL mode (where
-        they come straight from the ThingsBoard live feed).
-        """
-        scores = []
-        if ph is not None:
-            if ph >= 7.5:
-                scores.append(max(0.0, min(1.0, (ph - 7.5) / (9.0 - 7.5))))
-            else:
-                scores.append(max(0.0, min(1.0, (7.5 - ph) / (7.5 - 6.0))))
-        if ec is not None:
-            scores.append(max(0.0, min(1.0, (ec - 400.0) / (1000.0 - 400.0))))
-        if do is not None:
-            scores.append(max(0.0, min(1.0, (9.0 - do) / (9.0 - 5.0))))
-        return float(np.mean(scores)) if scores else 0.0
 
     # ------------------------------------------------------------------
     # Logging + alarm rule evaluation
@@ -504,8 +396,11 @@ class SimulationState:
           * warning : at least one warning rule hit and no critical hit.
           * (none)  : no configured rule hit.
         """
-        s = self.buoy_dt.sensor.data
-        ph = s.ph; ec = s.ec; do = s.do
+        s = self.buoy_dt.sensor_data
+        ph = s.ph
+        ec = s.ec
+        do = s.do
+
         if ph is None and ec is None and do is None:
             return
 
@@ -546,7 +441,7 @@ class SimulationState:
             "n_sensors_triggered": len(by_key_severity),
             "intensity":  getattr(self, "_last_intensity", 0.0),
             "conc":       getattr(self, "_last_concentration", 0.0),
-            "pollution_score": self.pollution_score(ph, ec, do),
+            "pollution_score": self.estimator.pollution_score(ph, ec, do),
         }
         self.measurement_log.append(entry)
         if len(self.measurement_log) > 5000:
@@ -580,202 +475,28 @@ class SimulationState:
                 if len(self.detection_history) > 1000:
                     self.detection_history = self.detection_history[-1000:]
 
-    # ------------------------------------------------------------------
-    # Bayesian source estimator
-    # ------------------------------------------------------------------
+    
     def estimate_source(self):
-        """
-        Bayesian source localization using the analytic 2-D Gaussian plume
-        as the forward model.
-
-        For a continuous point source at (s_x, s_y) with downstream
-        distance Δs = x_buoy - x_source projected on the centerline, the
-        steady-state concentration at the buoy is:
-
-            c(s -> b) = K / sqrt(Δs) * exp( -Δn² * U / (4 D_T Δs) )    if Δs > 0
-                      = 0                                              if Δs ≤ 0
-
-        where K is a constant we don't need to know (we normalise).
-
-        For every candidate source cell s and every logged measurement m
-        we compute this expected concentration, then form a likelihood:
-
-          * If the measurement triggered an alarm (severity != None)
-            with intensity i_obs, the candidate's score gets +w · c(s→b),
-            where w = 1 for warning / 3 for critical.
-          * If the measurement did NOT trigger the alarm but the candidate
-            WOULD have produced a strong plume at the buoy (c(s→b) is high),
-            the candidate is inconsistent → subtract a smaller penalty.
-
-        After all measurements are folded in, the score map is clipped to
-        non-negative and normalised to a probability distribution over
-        candidate source cells. The peak of this map is the most-likely
-        source.  Multiple buoy passes naturally accumulate evidence.
-
-        Properties:
-          * Candidates outside the river never get counted (the score map
-            is indexed by river-grid cells only — no boundary pile-up).
-          * The FIRST detection point pins down an upper bound on source
-            stream-position (source must be upstream of it).
-          * Lateral information from each measurement constrains cross-stream
-            position via the Gaussian's narrow lateral profile.
-          * NEW measurements multiply into the score → estimate sharpens.
-        """
-        if self.river is None or not self.measurement_log:
-            print("[Estimator] No data to estimate from.")
-            self.backtrack_map = None
-            self.backtracking = False
+        """Run the Bayesian estimator and update simulation state."""
+        
+        
+        # Run the math (pass it the logs and the true source for debugging)
+        result = self.estimator.estimate(
+            measurement_log=self.measurement_log, 
+            true_source_local=self.source_local
+        )
+        
+        # Update the state based on the result
+        if result is None:
+            self.probability_map = None
+            self.estimating = False
             return
-
-        r = self.river
-        n_stream, n_width = r.vis_v.shape
-        ds = r.ds_length
-        dn = r.dn
-        U  = max(0.1, float(config.DEFAULT_U_AVG))
-        D_T = max(1e-3, float(config.DEFAULT_D_T))
-        sigma2 = float(getattr(config, "ESTIMATOR_NOISE_SIGMA", 0.15)) ** 2
-
-        # ----- 1. Gather georeferenced measurements -----
-        valid_measurements = [
-            m for m in self.measurement_log
-            if m["x_local"] is not None and m["y_local"] is not None
-        ]
-        # Cap to most-recent N if log is very long (keeps newest evidence)
-        max_meas = int(getattr(config, "ESTIMATOR_MAX_MEASUREMENTS", 2000))
-        if len(valid_measurements) > max_meas:
-            valid_measurements = valid_measurements[-max_meas:]
-        if not valid_measurements:
-            print("[Estimator] No georeferenced measurements.")
-            self.backtrack_map = None
-            return
-
-        pts = np.array([[m["x_local"], m["y_local"]] for m in valid_measurements])
-        _, b_flat = r.physics_tree.query(pts, k=1)
-        b_i_all = (b_flat // n_width).astype(int)
-        b_j_all = (b_flat %  n_width).astype(int)
-
-        # ----- 2. Build observation vector c_obs (length M) -----
-        # Prefer the raw concentration value (SIM mode: directly from DV field;
-        # always has the widest dynamic range and best discrimination).
-        # In REAL mode fall back to inverting the sensor dose-response curve
-        # used by _synthesize_sim_sensors: eff = score, intensity = eff^(1/0.35).
-        # This restores the linear-in-concentration scale the analytic plume
-        # model expects, so the profile-MLE for Q is unbiased.
-        def _obs_for_estimator(m: dict) -> float:
-            c = m.get("conc", 0.0) or 0.0
-            if c > 0.0:
-                return float(c)
-            score = m.get("pollution_score",
-                          self.pollution_score(m.get("ph"), m.get("ec"), m.get("do")))
-            if score <= 0.0:
-                return 0.0
-            return float(score) ** (1.0 / 0.35)   # undo sqrt-style compression
-
-        c_obs = np.array([_obs_for_estimator(m) for m in valid_measurements],
-                         dtype=np.float64)
-
-        # ----- 3. For each candidate cell s, build "shape function" g_k(s) =
-        #         analytic-plume value at measurement k assuming source at s
-        #         with UNIT strength.  Then maximize over Q analytically:
-        #
-        #             Q*(s) = (Σ_k g_k(s) c_obs_k)  /  (Σ_k g_k(s)²)
-        #
-        #         Profile log-likelihood (Q marginalised at MLE):
-        #
-        #             log L(s) = - ||c_obs - Q*(s)·g(s)||² / (2σ²)
-        #                      = - (||c||² - Q*² · Σg²) / (2σ²)
-        #
-        # We accumulate Σg², Σ(g·c) over measurements in one vectorised pass.
-        # -----
-        i_grid, j_grid = np.meshgrid(np.arange(n_stream), np.arange(n_width),
-                                     indexing="ij")
-        sum_g2 = np.zeros((n_stream, n_width), dtype=np.float64)
-        sum_gc = np.zeros((n_stream, n_width), dtype=np.float64)
-        sum_c2 = float(np.sum(c_obs ** 2))
-
-        for k, m in enumerate(valid_measurements):
-            b_i = int(b_i_all[k]); b_j = int(b_j_all[k])
-
-            # Analytic Gaussian continuous-source plume (advection-dominated)
-            d_s = (b_i - i_grid) * ds                    # downstream distance
-            d_n = (b_j - j_grid) * dn                    # lateral offset
-            valid = d_s > ds                             # buoy must be downstream
-            with np.errstate(divide="ignore", invalid="ignore"):
-                g = np.where(
-                    valid,
-                    (1.0 / np.sqrt(np.maximum(d_s, ds))) *
-                    np.exp(-(d_n * d_n * U) / (4.0 * D_T * np.maximum(d_s, ds))),
-                    0.0,
-                )
-            sum_g2 += g * g
-            sum_gc += g * c_obs[k]
-
-        # ----- 4. Profile-MLE for source strength Q at every candidate -----
-        # eps avoids divide-by-zero for cells that no measurement could see.
-        eps = max(1e-9, 1e-6 * float(sum_g2.max() or 1.0))
-        Q_star = sum_gc / (sum_g2 + eps)
-        Q_star = np.clip(Q_star, 0.0, None)              # Q ≥ 0 prior
-
-        # Residual sum of squares (after substituting Q*):
-        #   ||c - Q*g||² = ||c||² - 2 Q* (g·c) + Q*² (g·g)
-        # at Q* = (g·c)/(g·g)  →  RSS = ||c||² − (g·c)² / (g·g)
-        rss = sum_c2 - (sum_gc * sum_gc) / (sum_g2 + eps)
-        rss = np.maximum(rss, 0.0)
-
-        # Profile log-likelihood (cells with no coverage get -inf-ish penalty)
-        log_L = -rss / (2.0 * sigma2)
-
-        # ----- 5. Convert to probability (softmax with max-subtraction) -----
-        # Mask cells that no measurement could see (their g is identically 0
-        # so RSS = ||c||² — a constant; they get equal probability among
-        # themselves. That's not informative, so down-weight them.)
-        coverage_mask = sum_g2 > 1e-12 * float(sum_g2.max() or 1.0)
-        log_L = np.where(coverage_mask, log_L, log_L.min() - 1e3)
-
-        log_L -= log_L.max()
-        prob = np.exp(log_L)
-        total = prob.sum()
-        if total <= 0 or not np.isfinite(total):
-            print("[Estimator] Degenerate posterior; widen ESTIMATOR_NOISE_SIGMA or collect more data.")
-            self.backtrack_map = None
-            return
-        prob /= total
-
-        self.backtrack_map = prob
-        self.backtracking = False
-
-        # ----- 6. Report -----
-        i, j = np.unravel_index(np.argmax(prob), prob.shape)
-        est_x = float(r.vis_x[i, j])
-        est_y = float(r.vis_y[i, j])
-        Q_at_peak = float(Q_star[i, j])
-        est_lat, est_lon = self.georef.sim_cartesian_to_gps(est_x, est_y)
-
-        n_det = sum(1 for m in valid_measurements if m.get("severity"))
-        n_non = len(valid_measurements) - n_det
-
-        # 1-sigma equivalent radius from the posterior (rough credible region)
-        # Estimated by computing the standard deviation of distance from the peak,
-        # weighted by the posterior probability.
-        xs_grid = r.vis_x
-        ys_grid = r.vis_y
-        dx2 = (xs_grid - est_x) ** 2
-        dy2 = (ys_grid - est_y) ** 2
-        var_r = float(np.sum(prob * (dx2 + dy2)))
-        std_r = float(np.sqrt(var_r))
-
-        if self.source_local is not None:
-            tx, ty = self.source_local
-            err = float(np.hypot(est_x - tx, est_y - ty))
-            print(f"[Estimator] {len(valid_measurements)} measurements "
-                  f"({n_det} alarms, {n_non} non-alarm); Q*={Q_at_peak:.3f}; "
-                  f"peak ({est_x:.1f}, {est_y:.1f}); true ({tx:.1f}, {ty:.1f}); "
-                  f"error = {err:.1f} m;  1-sigma ~ {std_r:.1f} m")
-        else:
-            print(f"[Estimator] {len(valid_measurements)} measurements "
-                  f"({n_det} alarms); Q*={Q_at_peak:.3f}; "
-                  f"peak local ({est_x:.1f}, {est_y:.1f}) "
-                  f"GPS ({est_lat:.6f}, {est_lon:.6f});  1-sigma ~ {std_r:.1f} m")
+            
+        prob_map, peak_coords = result
+        
+        self.probability_map = prob_map
+        self.estimating = False
+        
 
     def reset_contamination(self):
         self.contamination_detected = False
@@ -783,8 +504,8 @@ class SimulationState:
         self.contamination_rules_hit = []
         self.detection_history = []
         self._last_detection_sample_t = -1e9
-        self.backtrack_map = None
-        self.backtracking = False
+        self.probability_map = None
+        self.estimating = False
 
     def reset_buoy(self):
         """Return buoy to its chosen start position and clear its track."""
@@ -815,11 +536,45 @@ class SimulationState:
 
     def get_estimated_source_gps(self):
         """Return (lat, lon) of the current peak of the backtrack heatmap, or None."""
-        if self.backtrack_map is None or self.river is None:
+        if self.probability_map is None or self.river is None:
             return None
-        i, j = np.unravel_index(np.argmax(self.backtrack_map), self.backtrack_map.shape)
+        i, j = np.unravel_index(np.argmax(self.probability_map), self.probability_map.shape)
         return self.georef.sim_cartesian_to_gps(float(self.river.vis_x[i, j]),
                                                  float(self.river.vis_y[i, j]))
+
+    def get_concentration_data(self, x: float, y: float) -> tuple[float, float]:
+        if self.dv is None: 
+            return 0.0, 1.0
+                
+        try:
+            # Get the global max first
+            cmap = self.dv.get_concentration_map()
+            cmax = float(cmap.max() or 1.0)
+            
+            # Look up the local value
+            pts = np.array([[x, y]])
+            _, idx = self.river.physics_tree.query(pts, k=1)
+            idx = int(idx[0])
+            i = idx // self.river.n_width
+            j = idx %  self.river.n_width
+            c = float(cmap[i, j])
+            
+            return c, cmax
+        except Exception:
+            return 0.0, 1.0
+
+    def calculate_ds(self, topo): 
+            total_length = 0.0
+            for seg_type, measures in topo:
+                if seg_type == 0:
+                    total_length += measures
+                elif seg_type == 1:
+                    radius, angle_deg = measures
+                    total_length += radius * abs(np.radians(angle_deg))
+            n_length = config.DEFAULT_N_LENGTH
+            ds_length = total_length / n_length
+            return ds_length
+
 
     @property
     def placement_hint(self) -> str:

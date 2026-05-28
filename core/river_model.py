@@ -153,7 +153,7 @@ class River:
         # and express the lag as a fraction of that.
         c_max = np.max(np.abs(self.curv)) if np.any(self.curv != 0) else 1e-6
         r_dominant    = 1.0 / max(c_max, 1e-6)          # dominant bend radius (m)
-        lag_metres    = 0.3 * r_dominant                 # lag = 30% of bend radius
+        lag_metres    = 0.7 * r_dominant                 # lag = 30% of bend radius
         lag_steps     = max(1, int(lag_metres / ds_length))
         smooth_sigma  = max(1.0, lag_steps * 0.3)        # smooth over ~30% of lag
  
@@ -170,7 +170,7 @@ class River:
             nx, ny = -np.sin(angle), np.cos(angle)
 
             # Negate so that positive curvature = left bend → outer bank on left
-            C_local = -lagged_curv[i - 1]
+            C_local = lagged_curv[i - 1]
 
             for j, n in enumerate(n_vals):
                 # Grid cell centre coordinates
@@ -179,11 +179,11 @@ class River:
 
                 # Streamwise speed: faster on outer bank in a bend
                 perturbation = 0.7 * C_local * n
-                u_stream = max(0.0, u_avg * (1.0 + perturbation))
+                u_stream = max(0.0, u_avg * (1.0 - perturbation))
 
                 # Secondary (cross-stream) flow driven by centrifugal acceleration
-                u_sec = alpha_secondary * C_local * u_stream
-
+                u_sec = -alpha_secondary * C_local * u_stream
+                
                 # Combine into a single velocity vector, then extract magnitude + angle
                 vx = u_stream * tx + u_sec * nx
                 vy = u_stream * ty + u_sec * ny
@@ -209,6 +209,8 @@ class River:
 
 class DVsolver:
     """
+    Modified version of: https://discretize.simpeg.xyz/en/main/tutorials/pde/2_advection_diffusion.html
+
     2-D advection-dispersion solver for river contaminant plume.
 
         ∂C/∂t + ∇·(u C) = ∇·(D ∇C) + q
@@ -380,118 +382,3 @@ class DVsolver:
         return self.p.reshape((self.mesh.shape_cells[0], self.mesh.shape_cells[1]), order='F') 
 
     
-
-
-
-# =============================================================================
-# LagrangianParticles
-# =============================================================================
-
-class LagrangianParticles:
-    """
-    Stochastic Lagrangian particle tracker for contaminant plume simulation.
-
-    Particles are advected by the local flow field and dispersed by
-    random-walk diffusion in both the streamwise and cross-stream directions.
-
-    Parameters
-    ----------
-    river : River
-        The river model providing the flow field.
-    num_particles : int
-        Number of tracer particles to release.
-    x0, y0 : float
-        Release coordinates (metres, local river frame).
-    D_L : float
-        Longitudinal (streamwise) diffusion coefficient (m²/s).
-    D_T : float
-        Transverse (cross-stream) diffusion coefficient (m²/s).
-    """
-
-    def __init__(
-        self,
-        river: River,
-        num_particles: int,
-        x0: float,
-        y0: float,
-        D_L: float,
-        D_T: float,
-    ):
-        self.river = river
-        self.num   = num_particles
-        self.D_L   = D_L
-        self.D_T   = D_T
-
-        # Scatter the initial release around (x0, y0) with a small Gaussian spread
-        self.x = np.full(num_particles, x0) + np.random.normal(0, 0.5, num_particles)
-        self.y = np.full(num_particles, y0) + np.random.normal(0, 0.5, num_particles)
-
-    # ------------------------------------------------------------------
-
-    def update(self, dt: float):
-        """
-        Advance all particles by one time step dt (seconds).
-
-        Steps:
-          1. Look up the nearest grid cell velocity for each particle.
-          2. Advect along the streamwise direction.
-          3. Add Gaussian random-walk noise in both L and T directions.
-          4. Rotate displacement from (L, T) frame back to (x, y).
-          5. Enforce channel boundaries (elastic clamp).
-        """
-        points = np.column_stack((self.x, self.y))
-
-        # Nearest grid cell → local speed and flow angle
-        _, indices = self.river.physics_tree.query(points, k=1)
-        cell_data   = self.river.grid_data[indices]
-        U_local     = cell_data[:, 0]
-        theta_local = cell_data[:, 1]
-
-        # Streamwise advection + longitudinal diffusion
-        dL = U_local * dt + np.random.normal(0, 1, self.num) * np.sqrt(2 * self.D_L * dt)
-
-        # Transverse diffusion only (no mean cross-stream flow for particles)
-        dT = np.random.normal(0, 1, self.num) * np.sqrt(2 * self.D_T * dt)
-
-        # Rotate from local (L, T) frame to global (x, y) frame
-        c = np.cos(theta_local)
-        s = np.sin(theta_local)
-        self.x += dL * c - dT * s
-        self.y += dL * s + dT * c
-
-        self._enforce_boundaries()
-
-    # ------------------------------------------------------------------
-
-    def _enforce_boundaries(self):
-        """
-        Clamp particles that have escaped outside the channel banks.
-
-        Any particle further than 95% of the half-width from the nearest
-        centreline point is pushed back to that limit along the radial direction.
-        """
-        points = np.column_stack((self.x, self.y))
-        dists, indices = self.river.centerline_tree.query(points, k=1)
-
-        limit = self.river.half_width * 0.95
-        oob   = dists > limit
-
-        if not np.any(oob):
-            return
-
-        cx = self.river.xc[indices[oob]]
-        cy = self.river.yc[indices[oob]]
-        px = self.x[oob]
-        py = self.y[oob]
-
-        # Radial vector from centreline point to particle
-        vx = px - cx
-        vy = py - cy
-        norm = np.sqrt(vx**2 + vy**2)
-        norm[norm == 0] = 1.0   # guard against zero-length vector
-
-        # Push back to the boundary
-        self.x[oob] = cx + (vx / norm) * limit
-        self.y[oob] = cy + (vy / norm) * limit
-
-
