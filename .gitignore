@@ -21,6 +21,8 @@ dist/
 .DS_Store
 Thumbs.db
 
-
+# IDEs and AI tools
+.idea/
+.claude/
 
 
