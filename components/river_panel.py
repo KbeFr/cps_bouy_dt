@@ -486,7 +486,7 @@ def register_callbacks(app, sim_state, buoy_dt_instance):
             if sim_state.probability_map is None:
                 return _empty_fig("No estimation yet — awaiting estimation")
             data = sim_state.probability_map
-            title = "Backtrack — Source Probability"
+            title = "Source Probability Map"
         else:
             cmap = sim_state.get_concentration_map()
             if cmap is None:
